@@ -79,6 +79,18 @@ python tests/elastic/test_dispatch.py \
 
 combine 使用 `test_combine.py`，将 `--dtype both` 改为 `--dispatch-dtype bf16` 或 `--dispatch-dtype fp8` 并更换输出目录。共享文件系统中，每台主机的输出路径包含 node rank；不要让多个节点写同一个目录。
 
+HT 的 Notify、Dispatch 和 Combine 用例默认在 EP8/16 使用 rank 去重，其余规模使用 server 去重。`--rank-dedup`（别名 `--no-server-dedup`）和 `--server-dedup` 可显式切换。rank 去重保留同 rank 内归约，各 expert rank 独立回传，不执行 server 内 gather；server 去重在源 rank 命中本卡专家时优先由本卡中转。两种路径均与 CPU golden 比较；`--golden-notify` 可单独用于 CPU 建表对照。rank 去重与 `--with-dispatch` 同用时支持 EP8/16。
+
+EP8 的 rank 去重 Combine 自动使用 MTE 路径，支持 weight 回传，无需额外选项。
+
+对照时保持 EP、token、hidden、top-k、专家数、路由 seed、chunk 和 weights 一致，分别使用 `--server-dedup` 和 `--rank-dedup`。JSON 用 `deduplication=server/rank` 区分结果，并记录实际回传行数。带宽仍为逻辑数据量 `T*K*H*2 / duration / 1e9`（duration 单位为秒）；Notify、golden 建表及打点轮不计入 profiling 的 Combine kernel 时间。
+
+Combine 的 `--local-expert-first` 将 top-k 中属于源 rank 的专家稳定前移，其余专家保持顺序，专家集合不变。该路由对照选项默认关闭，不是本卡优先中转的前提。JSON 中记录 `local_expert_first`，两组测试应使用不同输出目录。
+
+`--without-replacement` 对每个 token 无放回选取专家；`--profile-flush-l2` 在每轮计时前冲刷 L2，清理耗时不计入 kernel 时间。profiling 默认预热 10 次、采样 50 次，逐 rank 保留全部时长。
+
+`--tokens-list`、`--chunk-tokens-list` 在一次初始化中遍历多个 shape；Notify 可用 `--notify-num-cores` 选择 32/64 核，Dispatch 用例的 `--notify-only --notify-num-cores-list 32 64` 只测 Notify。各 rank 必须使用相同配置。
+
 ## HT peer-table 检查与计时
 
 [run_peer_table_check.py](elastic/run_peer_table_check.py) 检查 BF16/FP8 dispatch 的路由和搬运结果，并提供独立计时入口。沿用前述 HT 的设备和 endpoint 设置，例如：

@@ -194,8 +194,8 @@ inline bool DispatchDedupPacketUbFits(const EpMemoryServerDedupLayout& layout, i
                               16 * layout.data.blockCount * 32 + 256 +
                               16 * align((layout.data.blockCount + 7) / 8, 32) * 4 + 256 + 16 * 36 +
                               layout.data.tokenStride + 64;
-    return layout.data.blockCount > 0 && layout.data.blockCount <= UINT8_MAX && sender + serverStateExtra <= kEpServerDedupCountUbBytes &&
-           receiver <= kEpServerDedupCountUbBytes;
+    return layout.data.blockCount > 0 && layout.data.blockCount <= UINT8_MAX &&
+           sender + serverStateExtra <= kEpServerDedupCountUbBytes && receiver <= kEpServerDedupCountUbBytes;
 }
 }  // namespace DispatchDedup
 

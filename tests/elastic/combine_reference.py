@@ -38,6 +38,7 @@ class CombineCase:
     chunk_tokens: int = 256
     group_size: int = 64
     first_chunk_splits: int = 4
+    server_dedup: bool = True
 
     @property
     def group_width(self):
@@ -227,9 +228,9 @@ class CombinePlan:
 def build_plan(case, rank):
     """Build only this rank's tables; two streaming passes, no global hidden tensor.
 
-    Output rows are stable expert/source/token/topk ordered. Gateway is the FIRST
-    valid route per server; balanced fixtures rotate contributor/gateway pairs,
-    not gateway semantics. Backward payloads are ordered by raw-token chunk,
+    Output rows are stable expert/source/token/topk ordered. Gateways prefer the
+    source rank when selected, otherwise the first valid route per server.
+    Backward payloads are ordered by raw-token chunk,
     then the destination gateway's topology group, then source rank. Only each
     nonempty chunk's final payload carries its one-based completion ID; the
     gateway's contributor mask removes any need for empty control tasks.
@@ -268,18 +269,22 @@ def build_plan(case, rank):
                 cursors[expert] += 1
                 if peer == rank:
                     ids[row] = (source * t + token) * k + slot
-                hits.setdefault(peer // 8, []).append((peer, row))
-            for server, records in hits.items():
-                gateway, primary = records[0]
+                hits.setdefault(peer // 8 if case.server_dedup else peer, []).append((peer, row))
+            for return_slot, (server, records) in enumerate(hits.items()):
+                primary_index = next((i for i, (peer, _) in enumerate(records) if peer == source), 0)
+                gateway, primary = records[primary_index]
                 primary_counts[gateway] += 1
                 if source == rank:
-                    masks[token] |= (1 << server) if server < 63 else -(1 << 63)
+                    slot = server if case.server_dedup else return_slot
+                    masks[token] |= (1 << slot) if slot < 63 else -(1 << 63)
                 if gateway == rank:
                     # One placeholder or len(records)-1 secondary rows; no boundary scan needed.
                     token_task_end = len(forwards[source]) // 6 + max(1, len(records) - 1)
                     if len(records) == 1:
                         forwards[source].extend((token_task_end, token, primary, -1, -1, -1))
-                for peer, row in records[1:]:
+                for index, (peer, row) in enumerate(records):
+                    if index == primary_index:
+                        continue
                     reduce_row = -1
                     if peer != gateway:
                         reduce_row = gathers[gateway]
@@ -415,6 +420,8 @@ def validate_plan(p):
             else:
                 if not 0 <= peer < c.world or peer // 8 != rank // 8 or not 0 <= row < p.rank_rows[peer]:
                     raise ValueError("bad forward contributor")
+                if not c.server_dedup and peer != rank:
+                    raise ValueError("rank return plans must not gather from another rank")
                 if peer == rank:
                     if reduce_row != -1:
                         raise ValueError("self contributor must not use gather")
@@ -471,8 +478,12 @@ def validate_plan(p):
         raise ValueError("chunk contributor mask mismatch")
     for token, actual in enumerate(p.server_mask):
         expected = 0
+        ranks = set()
         for expert in route_experts(rank, token, c):
             if expert >= 0:
                 expected |= 1 << (expert // (c.experts // c.world) // 8)
+                ranks.add(expert // (c.experts // c.world))
+        if not c.server_dedup:
+            expected = (1 << len(ranks)) - 1
         if actual & ((1 << 64) - 1) != expected:
             raise ValueError("source server mask mismatch")

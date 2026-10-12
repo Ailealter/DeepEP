@@ -15,6 +15,8 @@ Modified by Joyce_An 2026
 
 HT 接收行按专家分组，`handle.num_recv_tokens_per_expert_list` 给出各本地专家的行数；专家输出保持该行顺序。FP8 dispatch 后的专家输出也使用 BF16。
 
+HT 在 EP8/16 默认使用 rank 去重，同一 token 在同一 rank 的专家结果先本地归约再回传；其余规模默认使用 server 去重。两者使用相同接口和专家行布局。
+
 反向调用传入对应前向 Dispatch 返回的 handle：Combine 的反向用 `dispatch(grad_out, handle=handle)` 分发梯度；专家反向之后，用 `combine(grad_recv_x, handle, topk_weights=grad_recv_weights)` 返回输入梯度和路由权重梯度。
 
 首页的 `local_experts_forward/backward` 是模型提供的示例函数，不是 DeepEP 接口。专家计算、参数梯度及 `expert_ctx` 由模型管理；通信接口不提供内置 autograd。LL 暂不支持该反向流程。
@@ -48,7 +50,7 @@ combine 根据 `handle.is_low_latency` 执行匹配路径，不改变 handle 的
 | 路由 | int64 `topk_idx [T,K]`；可选 FP32 `topk_weights [T,K]` |
 | 调度 | BF16 dispatch：`num_compute_units=0/32`；FP8 dispatch 和 combine：`0/64`；`num_qps=0/2` |
 | 构造配置 | `num_allocated_qps=0/6`；0 使用固定配置 |
-| 同步 | `do_cpu_sync=None/True`；支持 `previous_event` 和 `async_with_compute_stream=True` |
+| 同步 | fresh Dispatch：`do_cpu_sync=None/True`；cached Dispatch 也接受 `False`；支持 `previous_event` 和 `async_with_compute_stream=True` |
 
 HT 不支持 epilogue event、累积统计、列主序 scales 或 `allocate_on_comm_stream=True`。异步返回仍可能包含计数读取和容量检查所需的 Host 同步。各 rank 的 weights 选项和 fresh/cached 模式须一致。
 

@@ -15,7 +15,11 @@ def decode_profile(records, rank, fp8=True, weights=False, world=64, qp1_workers
         raise ValueError("Expected 64 AIV records")
     decoded = []
     for core, words in enumerate(records):
-        if len(words) != 32 or words[26:29] != [0x44504550, rank, core] or words[30] not in (1, 2, 3, 4, 5, 6, 7, 8):
+        if (
+            len(words) != 32
+            or words[26:29] != [0x44504550, rank, core]
+            or words[30] not in (1, 2, 3, 4, 5, 6, 7, 8, 16)
+        ):
             raise ValueError(f"Missing/stale profile rank={rank} core={core}")
 
         def interval(start, end):
@@ -40,6 +44,23 @@ def decode_profile(records, rank, fp8=True, weights=False, world=64, qp1_workers
         )
         if world <= 8 and 7 <= core < clos_end:
             role = "idle"
+        if words[30] == 16:
+            clos_end = 24
+            role = (
+                rear_role
+                if core >= 32
+                else "fm"
+                if core < min(world, 8) - 1
+                else "local_forward"
+                if (world == 8 and core >= 7) or core >= clos_end
+                else "idle"
+                if world <= 8
+                else "relay_helper"
+                if core == 7
+                else "clos_qp0"
+                if core < 16
+                else "clos_qp1"
+            )
         phases = {
             "control_init_ms": interval(0, 1),
             "entry_barrier_ms": interval(1, 2),
@@ -71,6 +92,10 @@ def decode_profile(records, rank, fp8=True, weights=False, world=64, qp1_workers
             phases.update(
                 fm_ready_and_submit_ms=interval(4, 8), fm_terminal_so_ms=interval(8, 9), fm_quiet_ms=interval(9, 10)
             )
+        if words[30] == 16 and role in ("fm", "local_forward"):
+            phases["forward_scan_ms"] = words[14] / 1e6
+            if role == "local_forward":
+                phases.update(local_copy_ms=words[18] / 1e6, local_store_drain_ms=words[21] / 1e6)
         if role == "scale" or (words[30] >= 6 and core >= 32 and fp8):
             phases.update(
                 scale_send_ms=interval(31 if words[30] >= 2 else 3, 14),
@@ -319,10 +344,18 @@ def summarize(data):
         if len(plan_locations) != 1:
             raise ValueError("Cannot mix routing timing boundaries from different implementations")
         plan_in_notify = plan_locations.pop()
+        fused_locations = {
+            bool(sample.get("plan_in_notify_kernel", False)) for rank in data for sample in rank["routing_device_ms"]
+        }
+        if len(fused_locations) != 1:
+            raise ValueError("Cannot mix fused and standalone Notify plan samples")
+        fused_plan = fused_locations.pop()
         for field, names in (
             (
                 "notify_device_ms",
-                ("kernel", "post_barrier_and_plan" if plan_in_notify else "post_barrier", "count_copy", "total"),
+                ("kernel_with_plan", "event_gap_1", "event_gap_2", "total")
+                if fused_plan
+                else ("kernel", "post_barrier_and_plan" if plan_in_notify else "post_barrier", "count_copy", "total"),
             ),
             ("prepare_device_ms", ("clear", "kernel", "event_gap", "total")),
         ):
@@ -338,16 +371,25 @@ def summarize(data):
                     "mean_ms": mean(values),
                     "median_ms": median(values),
                 }
+        if fused_plan:
+            timing_note = (
+                "Notify kernel includes publication, plan and totals export; prepare Events are zero placeholders. "
+                "Private plan work is included in Notify ForwardCount/Prefix/Write/Exchange clocks; DispatchPlan is reserved and empty. "
+            )
+        else:
+            timing_note = (
+                (
+                    "Notify total includes preparation; prepare timings are nested, not additional. "
+                    if plan_in_notify
+                    else ""
+                )
+                + "Notify kernel excludes its post barrier and count copy; prepare kernel includes admission barriers "
+                "and forward-plan construction, excludes clear and host status readback. "
+            )
         result["routing_note"] = (
             "Separate fresh-handle passes, warmup excluded, no added pre-timing barrier. "
-            + (
-                "Notify total includes preparation; prepare timings are nested, not additional. "
-                if plan_in_notify
-                else ""
-            )
-            + "Notify kernel excludes its post barrier and count copy; prepare kernel includes its internal "
-            "admission barriers and forward-plan construction, excludes clear and host status readback. "
-            "Phase rank maxima must not be added to infer end-to-end latency."
+            + timing_note
+            + "Phase rank maxima must not be added to infer end-to-end latency."
         )
     result["profile_note"] = (
         "Separate instrumented passes; phases overlap across cores and their maxima must not be summed."

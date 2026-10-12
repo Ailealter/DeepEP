@@ -7,14 +7,27 @@ namespace ascend_deepep {
 using topk_idx_t = int64_t;
 inline constexpr uint32_t kNotifyLocalTopkRouteMetaFields = 6U;
 inline constexpr uint32_t kNotifyLocalTopkTileTokens = 16U;
-inline constexpr uint32_t kNotifyCores = 32U;
+inline constexpr uint32_t kNotifyCores = 64U;
 inline constexpr uint32_t kNotifyForwardTileRows = 32U;
-// EP128/256, T=16384, K=6, E=512: histogram/prefix <=96KiB,
-// forward metadata + stable row plan =96KiB, cached parse routes =24KiB.
+// EP256, T=16384, K=6, 64 AIVs: metadata/plan =48KiB, token prefixes =128KiB.
 // The same buffers are reused across phases; no symmetric-memory layout change.
-inline constexpr uint32_t kNotifyForwardMetaUbBytes = 96U * 1024U;
+inline constexpr uint32_t kNotifyForwardMetaUbBytes = 176U * 1024U;
 inline constexpr uint32_t kNotifyForwardBasesUbBytes = 24U * 1024U;
 inline constexpr uint32_t kNotifyCommunicationUbBytes = 8U * 1024U;
+inline constexpr uint32_t kNotifyChunkSegmentTokens = 64U;
+inline constexpr uint32_t kNotifyChunkSegmentWords = 11U;
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+__aicore__
+#endif
+    inline constexpr uint32_t
+    NotifyChunkSegments(uint32_t capacity, uint32_t chunks, uint32_t chunk_tokens)
+{
+    const uint64_t segments = (uint64_t(chunk_tokens) + kNotifyChunkSegmentTokens - 1U) / kNotifyChunkSegmentTokens;
+    return segments > 1U && segments <= 128U && chunks != 0U &&
+                   uint64_t(chunks) * segments * kNotifyChunkSegmentWords <= uint64_t(capacity) * 5U
+               ? uint32_t(segments)
+               : 1U;
+}
 inline constexpr uint32_t kNotifyPrefixSegmentTiles = 16U;
 inline constexpr uint32_t kNotifyPrefixBlockColumns = 16U;
 // 按连续 16 列搬运矩形块；每个核缓存自己负责的全部块，尾块仍预留完整空间。
@@ -32,6 +45,7 @@ inline constexpr bool NotifyLocalPrefixFitsUb(uint32_t rows, uint32_t block_rows
 // TPipe::InitBuffer 使用动态 UB；kernel 启动必须申请同样大小，不能只检查物理容量。
 inline constexpr uint32_t kNotifyDynamicUbBytes =
     kNotifyCommunicationUbBytes + kNotifyForwardMetaUbBytes + kNotifyForwardBasesUbBytes;
+inline constexpr uint32_t kNotifyDispatchPlanUbBytes = 4U * 1024U;
 static_assert(kNotifyDynamicUbBytes % 32U == 0U);
 
 // prefix 暂借通信 UB，每个 gateway 的计数行按 32B 对齐，GM 仍保持紧凑布局。
@@ -114,7 +128,13 @@ inline constexpr bool NotifyParseRoutesFitUb(uint32_t tokens, uint32_t topk, uin
 }
 inline constexpr uint32_t kNotifyPacketHeader = 64U;
 
+struct NotifyDispatchPlan {
+    uint64_t address = 0;
+    uint64_t phase_bytes = 0, rows_offset = 0, scratch_offset = 0, mailbox_offset = 0;
+};
+
 struct NotifyTiling {
+    uint32_t rank_dedup;
     uint32_t num_cores;
     uint32_t rank;
     uint32_t world;
@@ -155,6 +175,10 @@ struct NotifyTiling {
     uint64_t address_stride;
     uint64_t local_prefix_segments;
     uint64_t workspace_bytes;
+    // Optional Dispatch directory, built in the same Notify launch. Public
+    // routing/Combine tables and symmetric workspace offsets are unchanged.
+    NotifyDispatchPlan dispatch_plan;
+    uint64_t expert_totals_output = 0;
 };
 
 // 主机在检查 shape 和乘法上界后调用。设备直接消费偏移，不重新布局。
@@ -165,6 +189,7 @@ inline NotifyTiling MakeNotifyTiling(uint32_t rank, uint32_t world, uint32_t tok
     t.num_cores = num_cores;
     t.rank = rank;
     t.world = world;
+    t.rank_dedup = world == 8U || world == 16U;
     t.tokens = tokens;
     t.topk = topk;
     t.experts = experts;

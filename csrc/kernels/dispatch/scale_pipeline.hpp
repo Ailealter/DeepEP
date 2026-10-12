@@ -135,13 +135,13 @@ template <bool Profile>
 __aicore__ inline void Send(GM_ADDR workspace, const DispatchTiling& t, const PeerScalePlan& plan, const Layout& layout,
                             AscendC::TBuf<AscendC::QuePosition::VECCALC>& scratch,
                             AscendC::LocalTensor<uint32_t> errors, Peer& peer, uint32_t ordinal, uint32_t& pending,
-                            uint64_t* c)
+                            uint64_t* c, uint32_t capacity, uint64_t inbox_offset)
 {
     if (!peer.buffered || peer.failed) {
         return;
     }
     const uint32_t count = (peer.buffered + 1U) & ~1U;
-    if (uint64_t(peer.sent) + count > ((t.tokens * t.topk + 1U) / 2U * 2U)) {
+    if (uint64_t(peer.sent) + count > capacity) {
         peer.failed = true;
         return;
     }
@@ -166,7 +166,7 @@ __aicore__ inline void Send(GM_ADDR workspace, const DispatchTiling& t, const Pe
         if (2U * layout.peers > ascend_deepep::scale_pipeline::kCompletionEvents) {
             Acquire<Profile>(buffer, pending, c);
         }
-        auto* region = workspace + t.inbox + uint64_t(t.rank) * t.inbox_stride;
+        auto* region = workspace + t.inbox + uint64_t(t.rank) * t.inbox_stride + inbox_offset;
         Put(region + 512U + uint64_t(peer.sent / 2U) * 512U, packed, count / 2U * 512U, peer.rank);
         // One transfer contains complete 512B packets, including their tail flags.
         const uint32_t event = buffer % ascend_deepep::scale_pipeline::kCompletionEvents;
@@ -185,8 +185,7 @@ __aicore__ inline void Send(GM_ADDR workspace, const DispatchTiling& t, const Pe
 template <bool Profile, typename WqeScratch>
 __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const PeerScalePlan& plan,
                            AscendC::TBuf<AscendC::QuePosition::VECCALC>& scratch,
-                           AscendC::TBuf<AscendC::QuePosition::VECCALC>& local_scratch, WqeScratch& wqe_scratch,
-                           DispatchDeepep::DeepepSecondaryState& /*trace_state*/)
+                           AscendC::TBuf<AscendC::QuePosition::VECCALC>& local_scratch, WqeScratch& wqe_scratch)
 {
     using ascend_deepep::scale_pipeline::Make;
     const auto layout = Make(t.world, 224U);
@@ -194,8 +193,16 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
         aclshmemi_kernel_abort("invalid scale peer-double layout");
         return;
     }
-    const uint32_t owner = AscendC::GetBlockIdx() - 32U;
+    const uint32_t worker = AscendC::GetBlockIdx() - 32U;
     const uint32_t routes = t.tokens * t.topk;
+    const uint32_t shards = ascend_deepep::scale_pipeline::Shards(t.world);
+    const uint32_t shard = shards > 1U ? worker / t.world : 0U;
+    const uint32_t owner = shards > 1U ? worker % t.world : worker;
+    const uint32_t span = ascend_deepep::scale_pipeline::ShardRoutes(t.world, routes);
+    const uint32_t route_begin = shard * span < routes ? shard * span : routes;
+    const uint32_t route_end = (shard + 1U) * span < routes ? (shard + 1U) * span : routes;
+    const uint32_t capacity = (span + 1U) / 2U * 2U;
+    const uint64_t inbox_offset = uint64_t(shard) * (t.inbox_stride / shards);
     uint32_t address_shift = 0;
     for (uint32_t value = plan.address_stride; value > 1U; value >>= 1U) ++address_shift;
     const uint32_t peers = owner < t.world ? (t.world - 1U - owner) / 32U + 1U : 0U;
@@ -230,14 +237,15 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID2);
     for (uint32_t p = 0; p < peers; ++p) {
         state[p].rank = (owner + p * 32U + t.rank) % t.world;
+        WaitDispatchPeerEpoch(workspace, t, state[p].rank);
     }
 
     // Tile-major: load/decode each route once for all peers, including cross-pod.
     // Partial batches and both UB faces persist across tile boundaries.
     const uint64_t tx_start = Clock<Profile>();
     {
-        for (uint32_t begin = 0; begin < routes && peers; begin += layout.tile) {
-            const uint32_t n = routes - begin < layout.tile ? routes - begin : layout.tile;
+        for (uint32_t begin = route_begin; begin < route_end && peers; begin += layout.tile) {
+            const uint32_t n = route_end - begin < layout.tile ? route_end - begin : layout.tile;
             const uint32_t padded = (n + 63U) & ~63U;
             uint64_t start = Clock<Profile>();
             AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
@@ -289,14 +297,15 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
                     ++peer.entries;
                     c[3] += Clock<Profile>() - start;
                     if (peer.buffered == layout.batch) {
-                        Send<Profile>(workspace, t, plan, layout, scratch, errors, peer, p, pending, c);
+                        Send<Profile>(workspace, t, plan, layout, scratch, errors, peer, p, pending, c, capacity,
+                                      inbox_offset);
                     }
                 }
             }
         }
         for (uint32_t p = 0; p < peers; ++p) {
             auto& peer = state[p];
-            Send<Profile>(workspace, t, plan, layout, scratch, errors, peer, p, pending, c);
+            Send<Profile>(workspace, t, plan, layout, scratch, errors, peer, p, pending, c, capacity, inbox_offset);
             auto header = headers[p * 64U];
             for (uint32_t i = 0; i < 64U; ++i) {
                 header.SetValue(i, 0U);
@@ -320,7 +329,7 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
             if (state[p].rank == t.rank) {
                 continue;
             }
-            auto* region = workspace + t.inbox + uint64_t(t.rank) * t.inbox_stride;
+            auto* region = workspace + t.inbox + uint64_t(t.rank) * t.inbox_stride + inbox_offset;
             Put(reinterpret_cast<__gm__ uint64_t*>(region), headers[p * 64U], 64U, state[p].rank);
             c[7] += 512U;
             ++c[8];
@@ -341,13 +350,13 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
         if (source == t.rank) {
             continue;
         }
-        auto* region = workspace + t.inbox + uint64_t(source) * t.inbox_stride;
+        auto* region = workspace + t.inbox + uint64_t(source) * t.inbox_stride + inbox_offset;
         start = Clock<Profile>();
         DispatchAggregatePacket::Wait(region, 1U, t.generation, wqe_scratch);
         NativeLoadPacket(headers, reinterpret_cast<__gm__ uint64_t*>(region), 64U);
         const uint64_t count = headers.GetValue(1U), entries = headers.GetValue(2U);
-        if (headers.GetValue(0U) != t.generation || headers.GetValue(3U) ||
-            count > ((t.tokens * t.topk + 1U) / 2U * 2U) || entries > count || (count & 1U)) {
+        if (headers.GetValue(0U) != t.generation || headers.GetValue(3U) || count > capacity || entries > count ||
+            (count & 1U)) {
             ++c[12];
             continue;
         }

@@ -15,8 +15,8 @@ namespace EpServerOrder {
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__
 #endif
-inline uint32_t ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer,
-                                                uint32_t ordinal)
+    inline uint32_t
+    ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal)
 {
     const uint32_t split = servers / 2U;
     const bool lower = ownServer < split;
@@ -42,10 +42,10 @@ inline uint32_t ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer,
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__
 #endif
-inline uint32_t ServerDedupDispatchDirectOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal)
+    inline uint32_t
+    ServerDedupDispatchDirectOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal)
 {
-    return servers >= 16U ? ServerDedupHalfOrder(servers, ownServer, ordinal) :
-                           (ownServer + ordinal) % servers;
+    return servers >= 16U ? ServerDedupHalfOrder(servers, ownServer, ordinal) : (ownServer + ordinal) % servers;
 }
 }  // namespace EpServerOrder
 #endif

@@ -28,6 +28,8 @@ find_path(DEVICE_RT_INCLUDE rt.h HINTS
 add_library(deepep_kernels SHARED "${DEEPEP_SOURCE_DIR}/csrc/kernels/notify/notify.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/dispatch.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine.cpp"
+    "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/reuse.cpp"
+    "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine_ep8_mte.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/low_latency.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/low_latency.cpp")
 target_compile_options(deepep_kernels PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -xasc --npu-arch=dav-3510

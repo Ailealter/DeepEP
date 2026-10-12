@@ -5,6 +5,7 @@
 #include "../notify/tiling.hpp"
 #include "peer_protocol.hpp"
 #include "aux_pipeline_layout.hpp"
+#include "scale_pipeline_layout.hpp"
 
 namespace ascend_deepep {
 constexpr uint32_t kMaxDispatchRanks = 512U;
@@ -24,34 +25,26 @@ inline constexpr uint64_t DispatchPlanScratchOffset(uint32_t world, uint32_t tok
 inline constexpr uint64_t DispatchPlanMailboxOffset(uint32_t world, uint32_t tokens, uint32_t topk)
 {
     return DispatchPlanScratchOffset(world, tokens, topk) +
-           (uint64_t(world) * ((tokens + 31U) / 32U) * 20U + 511U) / 512U * 512U;
-}
-inline constexpr uint64_t DispatchForwardOffset(uint32_t world, uint32_t tokens, uint32_t topk)
-{
-    return DispatchPlanMailboxOffset(world, tokens, topk) + kClosSplitMailboxBytes;
-}
-inline constexpr uint64_t DispatchForwardHeaderBytes(uint32_t world)
-{
-    return (uint64_t(8U * (world + 1U) + 1U) * 4U + 511U) / 512U * 512U;
+           (uint64_t(world) * ((tokens + 15U) / 16U) * 16U + 511U) / 512U * 512U;
 }
 inline constexpr uint64_t DispatchPlanBytes(uint32_t world, uint32_t tokens, uint32_t topk)
 {
-    return DispatchForwardOffset(world, tokens, topk) + DispatchForwardHeaderBytes(world) +
-           (uint64_t(world) * tokens * topk * 8U + 511U) / 512U * 512U;
+    return DispatchPlanMailboxOffset(world, tokens, topk) + kClosSplitMailboxBytes;
 }
 struct DispatchTiling {
+    uint32_t dedup_group_size = 8U;
     // Framework-owned live GM buffers. Payload addresses are absolute virtual addresses,
     // never symmetric-heap offsets and never passed through aclshmem_ptr.
     uint64_t input_address = 0;
     uint64_t output_address = 0, output_weights_address = 0, output_scales_address = 0;
     uint64_t detail_profile = 0;  // Optional [64,32], see profile.hpp.
-    uint32_t rotation_wqes = 4, detail_mode = 0;
+    static constexpr uint32_t rotation_wqes = 4U;
+    uint32_t detail_mode = 0;
     uint64_t weight_profile = 0;  // Optional [32,16] rear-core aggregate counters.
     uint64_t weight_inbox = 0, weight_inbox_stride = 0;
     uint32_t weight_capacity = 0, output_rows = 0;
     uint64_t profile = 0;  // Optional [64,32] uint64 per-AIV diagnostics, outside SHMEM.
     uint64_t peer_table = 0, generation = 0, peer_book = 0, done = 0, plan_phase_bytes = 0;
-    uint64_t forward_plan_offset = 0, forward_header_bytes = 0;
     uint64_t plan_rows_offset = 0, plan_scratch_offset = 0, plan_mailbox_offset = 0;
     uint32_t rank, world, tokens, topk, rows, address_stride, fp8, hidden;
     uint64_t sync, book, input, output, weights, scales, inbox, inbox_stride, workspace_bytes;
@@ -68,8 +61,6 @@ inline DispatchTiling MakeDispatchTiling(uint32_t rank, uint32_t world, uint32_t
     t.plan_scratch_offset = DispatchPlanScratchOffset(world, tokens, topk);
     t.plan_mailbox_offset = DispatchPlanMailboxOffset(world, tokens, topk);
     t.plan_phase_bytes = DispatchPlanPhaseBytes(world, tokens);
-    t.forward_plan_offset = DispatchForwardOffset(world, tokens, topk);
-    t.forward_header_bytes = DispatchForwardHeaderBytes(world);
     t.rank = rank;
     t.world = world;
     t.tokens = tokens;
@@ -97,10 +88,12 @@ inline DispatchTiling MakeDispatchTiling(uint32_t rank, uint32_t world, uint32_t
     t.weights = reserve(uint64_t(rows) * 4);
     const uint32_t scale_words = hidden / 128U;
     t.scales = reserve(fp8 ? uint64_t(rows) * scale_words * 4U : 0);
-    t.inbox_stride = fp8 ? 512U + ((uint64_t(tokens) * topk + 1U) / 2U) * 512U : 0U;
+    const uint32_t scale_shards = scale_pipeline::Shards(world);
+    const uint64_t shard_routes = (uint64_t(tokens) * topk + scale_shards - 1U) / scale_shards;
+    t.inbox_stride = fp8 ? scale_shards * (512U + ((shard_routes + 1U) / 2U) * 512U) : 0U;
     t.inbox = reserve(uint64_t(world) * t.inbox_stride);
     t.peer_book = reserve(uint64_t(world) * 512U);
-    t.done = reserve(uint64_t(world) * 512U);
+    t.done = reserve(uint64_t(world) * kDispatchCompletionLanes * 512U);
     if (weights) {
         const uint64_t routes = uint64_t(tokens) * topk;
         t.weight_capacity = (routes + 59U) / 60U * 60U;

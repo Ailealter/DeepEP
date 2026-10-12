@@ -21,7 +21,4 @@ ASCEND_DEEPEP_EXPORT void notify_profile_kernel_do(void* stream, uint8_t* input,
                                                    uint8_t* weight_return_meta, uint8_t* profile, uint64_t sample,
                                                    uint8_t* tiling);
 ASCEND_DEEPEP_EXPORT void notify_dispatch_barrier_kernel_do(void* stream, uint32_t num_cores);
-ASCEND_DEEPEP_EXPORT void notify_dispatch_peer_plan_kernel_do(void* stream, uint8_t* workspace, uint8_t* dst,
-                                                              uint8_t* forward, uint8_t* counts, uint8_t* plan,
-                                                              uint8_t* tiling, uint64_t stride_offset);
 }

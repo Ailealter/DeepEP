@@ -20,6 +20,57 @@ from tests.utils.envs import Launch, owned_process_group, read_launch
 from tests.utils.reference import dispatch, expert_payload
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_cpp_function_extraction_ignores_comments_and_layout(compact):
+    from tests.utils.cpp import cpp_functions
+
+    source = r"""
+#pragma once
+namespace kernels {
+// inline int selected() { fake(); }
+inline int selected(int);
+/* Unrelated explanation with unmatched delimiters: { ( */
+template <class T>
+inline T selected(T value)
+{
+    const char* text = "selected() { \\\" }";
+    const char* raw = R"note(selected() { " } } )note";
+    char brace = '}';
+    if (value) { return value; }
+    return T{};
+}
+inline int caller() { return selected(1); }
+}
+"""
+    if compact:
+        source = source.replace("template <class T>\ninline T", "template<class T> inline T")
+        source = source.replace("selected(T value)\n{", "selected /* unrelated note */ (T value) {")
+    definition = cpp_functions(source, "selected")
+    assert definition.startswith("template")
+    assert "return T{};" in definition
+    assert definition.endswith("}\n")
+    assert "caller" not in definition
+    assert "fake" not in definition
+    assert "#pragma" not in definition
+    assert cpp_functions(source, "caller").strip() == "inline int caller() { return selected(1); }"
+
+
+@pytest.mark.parametrize(
+    "source, message",
+    [
+        ("inline int selected();", "found 0"),
+        ("int selected() {} int selected(int) {}", "found 2"),
+        ("int selected() {", "Unclosed"),
+        ("int selected(", "Unclosed"),
+    ],
+)
+def test_cpp_function_extraction_rejects_incomplete_or_ambiguous_input(source, message):
+    from tests.utils.cpp import cpp_functions
+
+    with pytest.raises(ValueError, match=message):
+        cpp_functions(source, "selected")
+
+
 @pytest.mark.parametrize(
     "change",
     [

@@ -83,7 +83,12 @@ def make_parser():
     parser.add_argument("--config", help="JSON settings and Cartesian matrix")
     parser.add_argument("--plan", action="store_true", help="Print the case matrix without importing Torch")
     parser.add_argument("--output-dir", default="benchmark-runs", help="Parent for a unique run directory and traces")
-    parser.add_argument("--perf-tail", type=int, default=30, help="Statistics use last N samples; default: min(30, num_iters); 0 uses all")
+    parser.add_argument(
+        "--perf-tail",
+        type=int,
+        default=30,
+        help="Statistics use last N samples; default: min(30, num_iters); 0 uses all",
+    )
     parser.add_argument("--num-processes", type=int, default=8, help="Local spawned processes, as in DeepEP")
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)
@@ -134,8 +139,12 @@ def make_parser():
     parser.add_argument("--test-first-only", action="store_true")
     parser.add_argument("--delay-rows", type=int, default=118260)
     parser.add_argument("--delay-cols", type=int, default=30720)
-    parser.add_argument("--delay-exp-before", type=int, default=None, help="Pre-kernel exp padding; default: disabled (0)")
-    parser.add_argument("--delay-exp-after", type=int, default=None, help="Exp padding after the first kernel; default: 1000")
+    parser.add_argument(
+        "--delay-exp-before", type=int, default=None, help="Pre-kernel exp padding; default: disabled (0)"
+    )
+    parser.add_argument(
+        "--delay-exp-after", type=int, default=None, help="Exp padding after the first kernel; default: 1000"
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--num-iters", type=int, default=50)
     parser.add_argument("--dispatch-only", action="store_true")
@@ -730,6 +739,7 @@ def run_case(buffer, args, rank, world, m, mode):
         )
 
     import hashlib
+
     mapped = {line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines() if len(line.split()) >= 6}
     classes = [
         [p for p in mapped if "/deep_ep/_C." in p and p.endswith(".so")],
@@ -758,13 +768,19 @@ def run_case(buffer, args, rank, world, m, mode):
     if not args.skip_check:
         agree_check(lambda: verify_dispatch(recv, handle, entries, args, world, m), args, rank)
     if args.dispatch_only:
-        result = {"case_id": args.case_id, "route": mode,
-                  "correctness": "skipped" if args.skip_check else "passed",
-                  "backend": "ll", "config": case_config(args, m),
-                  "tested_operations": ["dispatch"]}
+        result = {
+            "case_id": args.case_id,
+            "route": mode,
+            "correctness": "skipped" if args.skip_check else "passed",
+            "backend": "ll",
+            "config": case_config(args, m),
+            "tested_operations": ["dispatch"],
+        }
         if not args.skip_perf_test:
             profile = Path(args.run_directory) / f"case_{args.case_id:05d}" / mode
-            result["dispatch"] = measure(dispatch, args, "dispatch", profile / "dispatch" / f"rank_{rank:03d}", progress)
+            result["dispatch"] = measure(
+                dispatch, args, "dispatch", profile / "dispatch" / f"rank_{rank:03d}", progress
+            )
         if rank == 0:
             print(json.dumps(result, ensure_ascii=False), flush=True)
         completion_boundary(args)

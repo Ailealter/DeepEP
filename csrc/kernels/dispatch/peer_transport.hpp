@@ -19,7 +19,7 @@ __aicore__ inline uint32_t DeepepTransportQp(const DeepepSecondaryState& s, uint
 }
 __aicore__ inline void EnsureDeepepPeerAddress(DeepepSecondaryState& s, uint32_t peer)
 {
-    if (!s.address_peer_ready || (s.address_seen[peer / 64U] & (uint64_t(1) << (peer % 64U)))) return;
+    if (s.address_seen[peer / 64U] & (uint64_t(1) << (peer % 64U))) return;
     // Same single-record protocol as the private C++ peer-ready path. Observing
     // word3 accepts all three live virtual addresses under the target's 32B visibility assumption.
     auto* flag =
@@ -34,7 +34,7 @@ template <bool Profile>
 __aicore__ inline void PublishClosSimtUbWqes(__ubuf__ uint8_t* wqes, uint32_t count,
                                              __gm__ aclshmemi_udma_wq_ctx_t* ctx,
                                              __gm__ aclshmemi_udma_queue_state_t* state, uint64_t* detail,
-                                             uint32_t mode)
+                                             uint32_t mode, const uint32_t* db_ends, uint32_t db_count)
 {
     // Capacity for the WHOLE batch was admitted before VF. Use the SHMEM copy
     // and DB helpers, not flush_aggregate_wqes: that helper unconditionally
@@ -53,21 +53,18 @@ __aicore__ inline void PublishClosSimtUbWqes(__ubuf__ uint8_t* wqes, uint32_t co
         aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
                                         (count - first) * ctx->wqe_size, EVENT_ID0);
     }
-    // Both ring spans are complete before ONE DB; no data CQE counter update.
+    // Both ring spans are complete before the original visit-sized DBs.
     // SHMEM MTE3_S also makes the UB safe to reuse. This is not payload quiet.
     const uint64_t db_start = DetailClock<Profile>(mode);
     DetailAdd<Profile>(detail, 9U, db_start - copy_start);
-    aclshmemi_udma_post_send_update_info(head + count, ctx, state);
+    for (uint32_t i = 0U; i < db_count; ++i) aclshmemi_udma_post_send_update_info(head + db_ends[i], ctx, state);
     DetailAdd<Profile>(detail, 10U, DetailClock<Profile>(mode) - db_start);
-    DetailAdd<Profile>(detail, 1U, 1U);
+    DetailAdd<Profile>(detail, 1U, db_count);
     DetailAdd<Profile>(detail, 3U, first != count ? 1U : 0U);
 }
 
-#pragma once
-
-// Notify peer lists; server dedup is unchanged. Eight Clos
-// owners retain BOTH QPs for their peer set (physical lane by default;
-// EP64 group-offset uses source-local-rank staggered membership).
+// Eight peer sets, each with separate QP0 and QP1 AIVs. Both QPs retain
+// the same destination order and the Notify plan's 3:1 row partition.
 struct ClosPeerTablePeer {
     int32_t peer = -1;
     uint32_t begin[2]{}, count[2]{}, cursor[2]{};
@@ -134,7 +131,7 @@ __aicore__ inline void WaitClosPeerTableSoCqe(uint32_t peer, uint32_t qp, uint64
 
 struct ClosPeerTableQueue {
     uint64_t state = 0U;
-    uint32_t peer = 0U, qp = 0U, rows = 0U, mid_ticket = 0U, final_ticket = 0U;
+    uint32_t peer = 0U, qp = 0U, rows = 0U, critical_rows = 0U, mid_ticket = 0U, final_ticket = 0U;
     bool mid_used = false, mid_seen = false;
 };
 
@@ -161,18 +158,22 @@ __aicore__ inline void ClosRelayAssistPublishGeneration(__gm__ uint64_t* line, u
 // the live queue state: Clos may concurrently submit SO2 and change cqe_cnt.
 __aicore__ inline void PublishClosRelayAssist(DeepepSecondaryState& s, const ClosPeerTablePeer* peers,
                                               uint32_t peer_count, const ClosPeerTableQueue* queues,
-                                              uint32_t queue_count, bool group_offset = false, uint32_t split_task = 0U)
+                                              uint32_t queue_count, uint32_t split_task)
 {
     using namespace ascend_deepep;
-    auto* task = ClosRelayAssistOwner(s.clos_relay_mailbox, s.clos_split_qp ? split_task : s.core - 8U);
+    auto* task = ClosRelayAssistOwner(s.clos_relay_mailbox, split_task);
     auto* info = aclshmemi_udma_qp_info_fetch();
     auto* table = aclshmemi_udma_active_table(info);
     // Word3 is in the generation cache line; reused for profile only AFTER ACK.
     task[1] = queue_count;
     task[2] = peer_count;
-    task[3] = group_offset ? 1U : 0U;
+    task[3] = 0U;
     for (uint32_t q = 0U; q < queue_count; ++q) {
         const auto& queue = queues[q];
+        auto* record = task + kClosRelayAssistQueueWord + q * 4U;
+        record[0] = record[1] = record[2] = record[3] = 0U;
+        // No critical payload on this SQ: there is no SO1/CQE to observe.
+        if (!queue.critical_rows) continue;
         const uint32_t physical = DeepepTransportQp(s, queue.peer, queue.qp);
         const uint32_t slot = aclshmemi_udma_compute_slot(queue.peer, static_cast<uint32_t>(-1));
         auto* cq = reinterpret_cast<__gm__ aclshmemi_udma_cq_ctx_t*>(
@@ -183,7 +184,6 @@ __aicore__ inline void PublishClosRelayAssist(DeepepSecondaryState& s, const Clo
             trap();
             return;
         }
-        auto* record = task + kClosRelayAssistQueueWord + q * 4U;
         record[0] = cq->buf_addr + uint64_t(queue.mid_ticket & (depth - 1U)) * cq->cqe_size;
         record[1] = (queue.mid_ticket / depth) & 1U;
         record[2] = physical;
@@ -194,7 +194,8 @@ __aicore__ inline void PublishClosRelayAssist(DeepepSecondaryState& s, const Clo
         record[0] = uint32_t(peers[j].peer);
         record[1] = peers[j].queue[0];
         record[2] = peers[j].queue[1];
-        record[3] = 0U;
+        // Published while the peer counts still describe phase zero.
+        record[3] = peers[j].count[0] + peers[j].count[1];
     }
     // Do not touch the adjacent helper-owned ack line (one writer / cacheline).
     dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(task), kClosRelayAssistLineWords * 8U);
@@ -216,7 +217,7 @@ __aicore__ inline void ReportClosRelayAssistTimeout(const DeepepSecondaryState& 
     using namespace ascend_deepep;
     for (uint32_t owner = 0U; owner < 8U; ++owner) {
         if (state.done & (1U << owner)) continue;
-        for (uint32_t lane = 0U; lane < (s.clos_split_qp ? 2U : 1U); ++lane) {
+        for (uint32_t lane = 0U; lane < 2U; ++lane) {
             auto* task = ClosRelayAssistOwner(s.clos_relay_mailbox, owner + lane * 8U);
             auto* ack = task + kClosRelayAssistLineWords;
             const bool published = ClosRelayAssistGeneration(task, s.magic);
@@ -237,6 +238,7 @@ __aicore__ inline void ReportClosRelayAssistTimeout(const DeepepSecondaryState& 
                     (state.seen[owner][index / 64U] & (uint64_t(1) << (index % 64U))))
                     continue;
                 auto* record = task + kClosRelayAssistQueueWord + q * 4U;
+                if (!record[0]) continue;
                 auto* entry = reinterpret_cast<__gm__ aclshmemi_jfc_cqe_ctx_t*>(record[0]);
                 dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(entry), sizeof(aclshmemi_jfc_cqe_ctx_t));
                 aclshmemi_kernel_printf(
@@ -282,56 +284,38 @@ __aicore__ inline bool StepClosRelayAssist(DeepepSecondaryState& s, ClosRelayAss
         return false;
     }
     auto* task = ClosRelayAssistOwner(s.clos_relay_mailbox, owner);
-    auto* task1 = s.clos_split_qp ? ClosRelayAssistOwner(s.clos_relay_mailbox, owner + 8U) : task;
+    auto* task1 = ClosRelayAssistOwner(s.clos_relay_mailbox, owner + 8U);
     bool progress = false;
     if (!(state.started & bit)) {
         if (!ClosRelayAssistGeneration(task, s.magic)) {
             return false;
         }
-        if (s.clos_split_qp && !ClosRelayAssistGeneration(task1, s.magic)) {
+        if (!ClosRelayAssistGeneration(task1, s.magic)) {
             return false;
         }
         AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
         dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(task + kClosRelayAssistQueueWord),
                         (kClosRelayAssistOwnerWords - kClosRelayAssistQueueWord) * 8U);
-        if (s.clos_split_qp) {
-            dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(task1 + kClosRelayAssistQueueWord),
-                            (kClosRelayAssistOwnerWords - kClosRelayAssistQueueWord) * 8U);
-            if (task1[2] != task[2] || task1[3] != task[3] || task[1] > kClosRelayAssistPeers ||
-                task1[1] > kClosRelayAssistPeers) {
-                aclshmemi_kernel_abort("split-QP helper header mismatch\n");
-                trap();
-                return false;
-            }
-            for (uint32_t j = 0U; j < task[2] && j < kClosRelayAssistPeers; ++j) {
-                if (task[kClosRelayAssistPeerWord + j * 4U] != task1[kClosRelayAssistPeerWord + j * 4U]) {
-                    aclshmemi_kernel_abort("split-QP helper peer mismatch\n");
-                    trap();
-                    return false;
-                }
-            }
+        dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(task1 + kClosRelayAssistQueueWord),
+                        (kClosRelayAssistOwnerWords - kClosRelayAssistQueueWord) * 8U);
+        if (task1[2] != task[2] || task1[3] != task[3] || task[1] > kClosRelayAssistPeers ||
+            task1[1] > kClosRelayAssistPeers) {
+            aclshmemi_kernel_abort("split-QP helper header mismatch\n");
+            trap();
+            return false;
         }
-        // Validate the staggered ownership ONCE, not in the CQ polling loop.
-        if (task[3]) {
-            if (s.world != 64U || task[2] != 8U) {
-                aclshmemi_kernel_abort("relay assistant invalid offset layout\n");
+        for (uint32_t j = 0U; j < task[2] && j < kClosRelayAssistPeers; ++j) {
+            if (task[kClosRelayAssistPeerWord + j * 4U] != task1[kClosRelayAssistPeerWord + j * 4U]) {
+                aclshmemi_kernel_abort("split-QP helper peer mismatch\n");
                 trap();
                 return false;
-            }
-            for (uint32_t j = 0U; j < 8U; ++j) {
-                if (task[kClosRelayAssistPeerWord + j * 4U] != clos_offset64::Peer(s.rank, owner + j * 8U)) {
-                    aclshmemi_kernel_abort("relay assistant invalid offset peer\n");
-                    trap();
-                    return false;
-                }
             }
         }
         state.started |= bit;
         progress = true;
     }
     const uint32_t queues0 = static_cast<uint32_t>(task[1]);
-    const uint32_t queues = queues0 + (s.clos_split_qp ? static_cast<uint32_t>(task1[1]) : 0U),
-                   peers = static_cast<uint32_t>(task[2]);
+    const uint32_t queues = queues0 + static_cast<uint32_t>(task1[1]), peers = static_cast<uint32_t>(task[2]);
     if (!queues || queues > kClosRelayAssistQueues || peers != s.world / 8U || peers > kClosRelayAssistPeers) {
         aclshmemi_kernel_abort("relay assistant invalid mailbox\n");
         trap();
@@ -341,8 +325,13 @@ __aicore__ inline bool StepClosRelayAssist(DeepepSecondaryState& s, ClosRelayAss
         if (state.seen[owner][q / 64U] & (uint64_t(1) << (q % 64U))) {
             continue;
         }
-        auto* record = s.clos_split_qp && q >= queues0 ? task1 + kClosRelayAssistQueueWord + (q - queues0) * 4U
-                                                       : task + kClosRelayAssistQueueWord + q * 4U;
+        auto* record = q >= queues0 ? task1 + kClosRelayAssistQueueWord + (q - queues0) * 4U
+                                    : task + kClosRelayAssistQueueWord + q * 4U;
+        if (!record[0]) {
+            state.seen[owner][q / 64U] |= uint64_t(1) << (q % 64U);
+            progress = true;
+            continue;
+        }
         auto* entry = reinterpret_cast<__gm__ aclshmemi_jfc_cqe_ctx_t*>(record[0]);
         dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(entry), sizeof(aclshmemi_jfc_cqe_ctx_t));
         if (entry->owner == static_cast<uint32_t>(record[1])) {
@@ -363,7 +352,7 @@ __aicore__ inline bool StepClosRelayAssist(DeepepSecondaryState& s, ClosRelayAss
         }
         auto* record = task + kClosRelayAssistPeerWord + j * 4U;
         const uint32_t peer = static_cast<uint32_t>(record[0]);
-        if (peer >= s.world || (!task[3] && peer % 8U != owner)) {
+        if (peer >= s.world || peer % 8U != owner) {
             aclshmemi_kernel_abort("relay assistant invalid peer\n");
             trap();
             return false;
@@ -372,11 +361,18 @@ __aicore__ inline bool StepClosRelayAssist(DeepepSecondaryState& s, ClosRelayAss
             state.released[owner] |= uint64_t(1) << j;
             continue;
         }
+        const uint64_t critical = record[3] + task1[kClosRelayAssistPeerWord + j * 4U + 3U];
+        if (!critical) {
+            // No downstream relay waits for this peer. Still ACK the local
+            // mailbox so its owner may retire/reuse completion snapshots.
+            state.released[owner] |= uint64_t(1) << j;
+            state.pending |= bit;
+            progress = true;
+            continue;
+        }
         const uint32_t q0 = static_cast<uint32_t>(record[1]);
-        const uint32_t q1 = s.clos_split_qp
-                                ? queues0 + static_cast<uint32_t>(task1[kClosRelayAssistPeerWord + j * 4U + 2U])
-                                : static_cast<uint32_t>(record[2]);
-        if (q0 >= queues0 || q1 >= queues || (s.clos_split_qp && q1 < queues0)) {
+        const uint32_t q1 = queues0 + static_cast<uint32_t>(task1[kClosRelayAssistPeerWord + j * 4U + 2U]);
+        if (q0 >= queues0 || q1 >= queues || q1 < queues0) {
             aclshmemi_kernel_abort("relay assistant invalid queue map\n");
             trap();
             return false;
@@ -433,10 +429,8 @@ __aicore__ inline void DrainClosRelayAssist(DeepepSecondaryState& s, ClosRelayAs
 
         // CQ slots cannot be retired/reused until this release is observed.
         ClosRelayAssistPublishGeneration(ack, s.magic);
-        if (s.clos_split_qp) {
-            auto* ack1 = ClosRelayAssistOwner(s.clos_relay_mailbox, owner + 8U) + kClosRelayAssistLineWords;
-            ClosRelayAssistPublishGeneration(ack1, s.magic);
-        }
+        auto* ack1 = ClosRelayAssistOwner(s.clos_relay_mailbox, owner + 8U) + kClosRelayAssistLineWords;
+        ClosRelayAssistPublishGeneration(ack1, s.magic);
         state.done |= bit;
         DispatchProfileMark<Profile>(s.profile, 16U + owner);
     }
@@ -528,6 +522,31 @@ __simt_vf__ __launch_bounds__(32) inline void DispatchBuildPeerTableWqesVf(__ubu
 
 #include "wqe_cache.hpp"
 
+// One packet follows the exact visit order of a single SQ. It never crosses
+// a stage/SO boundary. The UB is disjoint from all per-peer descriptor caches
+// and the two frozen Notify directories; no additional allocation is needed.
+constexpr uint32_t kClosPendingOffset = kClosBuiltWqesEnd + 2U * 512U * 4U * sizeof(uint32_t);
+static_assert(kClosPendingOffset + 32U * kUdmaWqeBytes <= kSlotSelectUbBytes);
+struct ClosPendingPacket {
+    uint64_t context = 0U, state = 0U;
+    uint32_t count = 0U, visits = 0U, ends[8]{};
+};
+
+template <bool Profile>
+__aicore__ inline void FlushClosPacket(ClosPendingPacket& packet, DeepepSecondaryState& s,
+                                       AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
+{
+    if (!packet.count) return;
+    auto wqes = slots.GetWithOffset<uint8_t>(32U * kUdmaWqeBytes, kClosPendingOffset);
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    PublishClosSimtUbWqes<Profile>(reinterpret_cast<__ubuf__ uint8_t*>(wqes.GetPhyAddr()), packet.count,
+                                   reinterpret_cast<__gm__ aclshmemi_udma_wq_ctx_t*>(packet.context),
+                                   reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(packet.state), s.detail,
+                                   s.detail_mode, packet.ends, packet.visits);
+    packet.count = packet.visits = 0U;
+}
+
 __aicore__ inline bool EnsureClosSqCredit(DeepepSecondaryState& s, uint32_t peer, uint32_t qp, uint32_t phase,
                                           __gm__ aclshmemi_udma_queue_state_t* state, uint32_t n,
                                           __ubuf__ uint8_t* scratch)
@@ -566,9 +585,9 @@ __aicore__ inline bool EnsureClosSqCredit(DeepepSecondaryState& s, uint32_t peer
     return true;
 }
 
-template <bool Profile, bool Fp8>
+template <bool Profile>
 __aicore__ inline void IssueClosPeerTableVisit(DeepepPrimaryState& p, ClosPeerTablePeer& peer, uint32_t qp,
-                                               uint32_t phase, __ubuf__ uint8_t* scratch,
+                                               uint32_t phase, ClosPendingPacket& packet, __ubuf__ uint8_t* scratch,
                                                AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
 {
     const uint32_t remaining = peer.count[qp] - peer.cursor[qp];
@@ -576,17 +595,18 @@ __aicore__ inline void IssueClosPeerTableVisit(DeepepPrimaryState& p, ClosPeerTa
         return;
     }
     auto& s = *p.secondary;
-    const uint32_t rotation_wqes = s.rotation_wqes;
+    const uint32_t rotation_wqes = ascend_deepep::DispatchTiling::rotation_wqes;
     const uint32_t n = remaining < rotation_wqes ? remaining : rotation_wqes;
     DetailAdd<Profile>(s.detail, 0U, n);
     DetailAdd<Profile>(s.detail, 2U, n < rotation_wqes ? 1U : 0U);
     DetailAdd<Profile>(s.detail, 24U + s.detail_phase, n);
     DetailAdd<Profile>(s.detail, 26U + s.detail_phase, 1U);
     const uint64_t ready_start = DetailClock<Profile>(s.detail_mode);
-    if (s.address_peer_ready && !peer.target) {
+    if (!peer.target) {
         // Lazy lookup: an unused/future peer must not delay this visit.
+        FlushClosPacket<Profile>(packet, s, slots);
         EnsureDeepepPeerAddress(s, peer.peer);
-        peer.target = reinterpret_cast<uint64_t>(PeerHiddenAddress(s.book, peer.peer, s.book_words));
+        peer.target = reinterpret_cast<uint64_t>(PeerHiddenAddress(s.book, peer.peer));
         if (!peer.target) {
             aclshmemi_kernel_abort("peer-table missing live output\n");
             trap();
@@ -598,12 +618,24 @@ __aicore__ inline void IssueClosPeerTableVisit(DeepepPrimaryState& p, ClosPeerTa
     const uint64_t first = peer.begin[qp] + uint64_t(peer.cursor[qp]);
     auto* ctx = reinterpret_cast<__gm__ aclshmemi_udma_wq_ctx_t*>(peer.context[qp]);
     auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(ctx->state_addr);
-    if (!EnsureClosSqCredit(s, peer.peer, qp, phase, state, n, scratch)) return;
+    if (packet.count && (packet.state != ctx->state_addr || packet.count + n > 32U || packet.visits == 8U))
+        FlushClosPacket<Profile>(packet, s, slots);
+    if (!packet.count) {
+        // Admit the entire bounded packet before writing any of its SQ slots.
+        if (!EnsureClosSqCredit(s, peer.peer, qp, phase, state, 32U, scratch)) return;
+        packet.context = reinterpret_cast<uint64_t>(ctx);
+        packet.state = ctx->state_addr;
+    }
     auto wqes =
         PrepareClosBuiltWqes<Profile>(s, peer.peer, DeepepTransportQp(s, peer.peer, qp), table + first * 2U, remaining,
                                       n, reinterpret_cast<uint64_t>(p.input), peer.target, scratch, slots);
-    PublishClosSimtUbWqes<Profile>(reinterpret_cast<__ubuf__ uint8_t*>(wqes.GetPhyAddr()), n, ctx, state, s.detail,
-                                   s.detail_mode);
+    auto packed = slots.GetWithOffset<int32_t>(32U * 16U, kClosPendingOffset);
+    Copy(packed[packet.count * 16U], wqes.template ReinterpretCast<int32_t>(), uint64_t(n * 16U), 1U, {1U, 1U, 8U, 8U});
+    // Retire the cache read before any later builder reuses that peer's UB.
+    PipeBarrier<PIPE_V>();
+    packet.count += n;
+    packet.ends[packet.visits++] = packet.count;
+    if (packet.count == 32U || packet.visits == 8U) FlushClosPacket<Profile>(packet, s, slots);
     const uint64_t bytes = uint64_t(n) * s.row_bytes;
     peer.cursor[qp] += n;
     p.bytes += bytes;
@@ -620,11 +652,11 @@ struct ClosSplitLane {
     uint64_t so[2]{}, seen = 0U, seen_scan = 0U;
 };
 struct ClosSplitState {
-    ClosSplitLane lanes[1]{};
+    ClosSplitLane lane{};
+    ClosPendingPacket pending{};
     uint64_t tables[2]{};
-    uint32_t qp = 0U, lane_count = 1U, peer_count = 0U, visit_width = 4U;
+    uint32_t qp = 0U, peer_count = 0U, visit_width = 4U;
     uint32_t phase = 0U, window = 0U;
-    bool group_offset = false, interleave = false, balanced = false, pod_staged = false;
 };
 
 __aicore__ inline __gm__ uint64_t* ClosSplitLinks(uint64_t mailbox, uint32_t task)
@@ -667,19 +699,19 @@ template <bool Profile>
 __aicore__ inline void LoadClosSplitPhase(ClosSplitState& x, DeepepSecondaryState& s,
                                           AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
 {
-    for (uint32_t l = 0U; l < x.lane_count; ++l) {
-        for (uint32_t j = 0U; j < x.peer_count; ++j) {
-            auto& peer = x.lanes[l].peers[j];
-            if (uint32_t(peer.peer) / 8U == s.rank / 8U) {
-                continue;
-            }
-            auto rows = ClosDirectory(slots, x.phase);
-            peer.begin[x.qp] = rows.GetValue(peer.peer * 4U + x.qp * 2U);
-            peer.count[x.qp] = rows.GetValue(peer.peer * 4U + x.qp * 2U + 1U);
-            peer.cursor[x.qp] = 0U;
-            DetailAdd<Profile>(s.detail, 5U, peer.count[x.qp]);
-            DetailAdd<Profile>(s.detail, 6U, (peer.count[x.qp] + s.rotation_wqes - 1U) / s.rotation_wqes);
+    for (uint32_t j = 0U; j < x.peer_count; ++j) {
+        auto& peer = x.lane.peers[j];
+        if (uint32_t(peer.peer) / 8U == s.rank / 8U) {
+            continue;
         }
+        auto rows = ClosDirectory(slots, x.phase);
+        peer.begin[x.qp] = rows.GetValue(peer.peer * 4U + x.qp * 2U);
+        peer.count[x.qp] = rows.GetValue(peer.peer * 4U + x.qp * 2U + 1U);
+        peer.cursor[x.qp] = 0U;
+        DetailAdd<Profile>(s.detail, 5U, peer.count[x.qp]);
+        DetailAdd<Profile>(s.detail, 6U,
+                           (peer.count[x.qp] + ascend_deepep::DispatchTiling::rotation_wqes - 1U) /
+                               ascend_deepep::DispatchTiling::rotation_wqes);
     }
 }
 
@@ -691,15 +723,8 @@ __aicore__ inline void InitClosSplit(ClosSplitState& x, DeepepPrimaryState& p,
     auto h = slots.Get<uint32_t>();
     NativeLoad(h, reinterpret_cast<__gm__ uint32_t*>(p.clos_peer_table), 16U);
     const uint32_t options = h.GetValue(ascend_deepep::kClosPeerTableOptionsWord);
-    const uint32_t qp1_workers = (options & ascend_deepep::kClosPeerTableQp1EightWorkers) ? 8U : 4U;
-    if (qp1_workers != ascend_deepep::scale_clos::Qp1Workers(s.world)) {
-        aclshmemi_kernel_abort("split-QP worker schedule mismatch\n");
-        trap();
-        return;
-    }
-    if (h.GetValue(4U) != 3U || !s.clos_shared_jetty || s.core < 8U || s.core >= 16U + qp1_workers || s.scale_bytes ||
-        s.scale_send_offset || (options & ascend_deepep::kClosPeerTablePairedVf) ||
-        !(options & ascend_deepep::kClosPeerTableSplitQp) ||
+    if (h.GetValue(4U) != 3U || options != ascend_deepep::DefaultClosPeerTableOptions(s.world) || s.core < 8U ||
+        s.core >= 24U ||
         (s.world != 16U && s.world != 32U && s.world != 64U && s.world != 128U && s.world != 256U && s.world != 512U)) {
         aclshmemi_kernel_abort("invalid split-QP table\n");
         trap();
@@ -708,90 +733,64 @@ __aicore__ inline void InitClosSplit(ClosSplitState& x, DeepepPrimaryState& p,
     x.tables[0] = p.clos_peer_table;
     x.tables[1] = p.clos_peer_table + uint64_t(h.GetValue(5U)) * 4U;
     x.qp = s.core >= 16U ? 1U : 0U;
-    x.lane_count = x.qp ? 8U / qp1_workers : 1U;
     x.peer_count = s.world / 8U;
-    x.group_offset = (options & ascend_deepep::kClosPeerTableGroupOffset64) != 0U;
-    x.interleave = (options & ascend_deepep::kClosPeerTablePodInterleave) != 0U;
-    x.balanced = (options & ascend_deepep::kClosPeerTableBalancedLayout) != 0U;
-    x.pod_staged = (options & ascend_deepep::kClosPeerTablePodStaged) != 0U;
-    if ((x.pod_staged &&
-         ((s.world != 128U && s.world != 256U && s.world != 512U) || !x.balanced || x.interleave || x.group_offset)) ||
-        (s.world >= 256U && !x.pod_staged)) {
-        aclshmemi_kernel_abort("invalid split-QP pod-staged order\n");
-        trap();
-        return;
-    }
-    if ((x.group_offset && (s.world != 64U || x.interleave || x.balanced)) || (x.interleave && s.world != 128U)) {
-        aclshmemi_kernel_abort("invalid split-QP target order\n");
-        trap();
-        return;
-    }
-    x.visit_width = x.group_offset ? 2U : (x.interleave || x.pod_staged) ? 8U : 4U;
+    x.visit_width = s.world >= 128U ? 8U : 4U;
     if (x.visit_width > x.peer_count) x.visit_width = x.peer_count;
-    for (uint32_t l = 0U; l < x.lane_count; ++l) {
-        auto& lane = x.lanes[l];
-        lane.owner = x.qp ? s.core - 16U + l * qp1_workers : s.core - 8U;
-        s.clos_table_owner = lane.owner;
-        for (uint32_t j = 0U; j < x.peer_count; ++j) {
-            auto& peer = lane.peers[j];
-            peer.peer = ascend_deepep::scale_clos::Peer(s.rank, s.world, lane.owner, j, x.interleave, x.balanced,
-                                                        x.group_offset, x.pod_staged);
-            if (uint32_t(peer.peer) / 8U == s.rank / 8U) {
-                continue;
-            }
-            // Data addresses are resolved by the first non-empty visit.
-            // SO sinks (slots 2/4) retain prior generations across invocations and
-            // are not reset by InitializeTokenScatterPeerSignals. The relay
-            // assistant separately waits before publishing final flags.
-            if (!s.address_peer_ready) {
-                peer.target = reinterpret_cast<uint64_t>(PeerHiddenAddress(s.book, peer.peer, s.book_words));
-                if (!peer.target) {
-                    aclshmemi_kernel_abort("split-QP missing live output\n");
-                    trap();
-                    return;
-                }
-            }
-
-            const uint32_t physical = DeepepTransportQp(s, peer.peer, x.qp);
-            auto* ctx =
-                aclshmemi_udma_get_qp_ctx(aclshmemi_udma_qp_info_fetch(),
-                                          aclshmemi_udma_compute_slot(peer.peer, static_cast<uint32_t>(-1)), physical);
-            if (!ctx->state_addr || ctx->wqe_size != 64U || ctx->depth != shm::UDMA_SQ_BASKBLK_CNT) {
-                aclshmemi_kernel_abort("split-QP SQ ABI mismatch\n");
-                trap();
-                return;
-            }
-            peer.context[x.qp] = reinterpret_cast<uint64_t>(ctx);
-            uint32_t q = 0U;
-            while (q < lane.count && lane.queues[q].state != ctx->state_addr) {
-                ++q;
-            }
-            if (q == lane.count) {
-                lane.queues[q].state = ctx->state_addr;
-                lane.queues[q].peer = peer.peer;
-                lane.queues[q].qp = x.qp;
-                ++lane.count;
-            }
-            peer.queue[x.qp] = q;
-            for (uint32_t phase = 0U; phase < 2U; ++phase) {
-                auto rows = ClosDirectory(slots, phase);
-                lane.queues[q].rows += rows.GetValue(peer.peer * 4U + x.qp * 2U + 1U);
-            }
+    auto& lane = x.lane;
+    lane.owner = x.qp ? s.core - 16U : s.core - 8U;
+    s.clos_table_owner = lane.owner;
+    for (uint32_t j = 0U; j < x.peer_count; ++j) {
+        auto& peer = lane.peers[j];
+        peer.peer = ascend_deepep::scale_clos::Peer(s.rank, s.world, lane.owner, j);
+        if (uint32_t(peer.peer) / 8U == s.rank / 8U) {
+            continue;
         }
-        for (uint32_t q = 0U; q < lane.count; ++q) {
-            auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(lane.queues[q].state);
-            if (state->cqe_cnt != state->cq_tail || !aclshmemi_udma_sq_has_credit(state, s.rotation_wqes + 2U)) {
-                aclshmemi_kernel_abort("split-QP tables exceed available SQ\n");
-                trap();
-                return;
-            }
+        // Data addresses are resolved by the first non-empty visit.
+        // SO sinks (slots 2/4) retain prior generations across invocations and
+        // are not reset by InitializeTokenScatterPeerSignals. The relay
+        // assistant separately waits before publishing final flags.
+        const uint32_t physical = DeepepTransportQp(s, peer.peer, x.qp);
+        auto* ctx =
+            aclshmemi_udma_get_qp_ctx(aclshmemi_udma_qp_info_fetch(),
+                                      aclshmemi_udma_compute_slot(peer.peer, static_cast<uint32_t>(-1)), physical);
+        if (!ctx->state_addr || ctx->wqe_size != 64U || ctx->depth != shm::UDMA_SQ_BASKBLK_CNT) {
+            aclshmemi_kernel_abort("split-QP SQ ABI mismatch\n");
+            trap();
+            return;
+        }
+        peer.context[x.qp] = reinterpret_cast<uint64_t>(ctx);
+        uint32_t q = 0U;
+        while (q < lane.count && lane.queues[q].state != ctx->state_addr) {
+            ++q;
+        }
+        if (q == lane.count) {
+            lane.queues[q].state = ctx->state_addr;
+            lane.queues[q].peer = peer.peer;
+            lane.queues[q].qp = x.qp;
+            ++lane.count;
+        }
+        peer.queue[x.qp] = q;
+        for (uint32_t phase = 0U; phase < 2U; ++phase) {
+            auto rows = ClosDirectory(slots, phase);
+            const uint32_t count = rows.GetValue(peer.peer * 4U + x.qp * 2U + 1U);
+            lane.queues[q].rows += count;
+            if (phase == 0U) lane.queues[q].critical_rows += count;
+        }
+    }
+    for (uint32_t q = 0U; q < lane.count; ++q) {
+        auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(lane.queues[q].state);
+        if (state->cqe_cnt != state->cq_tail ||
+            !aclshmemi_udma_sq_has_credit(state, ascend_deepep::DispatchTiling::rotation_wqes + 2U)) {
+            aclshmemi_kernel_abort("split-QP tables exceed available SQ\n");
+            trap();
+            return;
         }
     }
     LoadClosSplitPhase<Profile>(x, s, slots);
 }
 
 // One sweep over the current stage. No receiver credit/owner barrier added.
-template <bool Profile, bool Fp8>
+template <bool Profile>
 __aicore__ inline bool StepClosSplit(ClosSplitState& x, DeepepPrimaryState& p, __ubuf__ uint8_t* wqe,
                                      AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
 {
@@ -803,44 +802,40 @@ __aicore__ inline bool StepClosSplit(ClosSplitState& x, DeepepPrimaryState& p, _
     if constexpr (Profile) s.detail_phase = x.phase;
     bool remaining = false;
     for (uint32_t j = x.window * x.visit_width; j < (x.window + 1U) * x.visit_width; ++j) {
-        for (uint32_t l = 0U; l < x.lane_count; ++l) {
-            auto& lane = x.lanes[l];
-            auto& peer = lane.peers[j];
-            if (uint32_t(peer.peer) / 8U == s.rank / 8U) {
-                continue;
-            }
-            s.clos_table_owner = lane.owner;
-            IssueClosPeerTableVisit<Profile, Fp8>(p, peer, x.qp, x.phase, wqe, slots);
-            remaining |= peer.cursor[x.qp] != peer.count[x.qp];
+        auto& lane = x.lane;
+        auto& peer = lane.peers[j];
+        if (uint32_t(peer.peer) / 8U == s.rank / 8U) {
+            continue;
         }
-    }
-    if (remaining || ++x.window < x.peer_count / x.visit_width) {
-        return false;
-    }
-    for (uint32_t l = 0U; l < x.lane_count; ++l) {
-        auto& lane = x.lanes[l];
         s.clos_table_owner = lane.owner;
-        for (uint32_t q = 0U; q < lane.count; ++q) {
-            auto& queue = lane.queues[q];
-            auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(queue.state);
-            // Pressure checkpoints may retire earlier CQEs; snapshot the actual phase ticket.
-            if (x.phase == 0U) {
-                queue.mid_ticket = state->cqe_cnt;
-            } else {
-                queue.final_ticket = state->cqe_cnt;
-            }
-            DetailAdd<Profile>(s.detail, 4U, 1U);
-            aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kUdmaSyncSoCqeConfig>(
-                GetPeerCompletionFlag(s.rank, GetGroupRankIndex(queue.peer, s.world), 2U + 2U * x.qp, s.sync),
-                GetPeerCompletionFlag(s.rank, GetGroupRankIndex(queue.peer, s.world), kPeerCompletionValueSlot, s.sync),
-                reinterpret_cast<__ubuf__ uint64_t*>(wqe), 1U, queue.peer, DeepepTransportQp(s, queue.peer, x.qp),
-                EVENT_ID0);
-        }
-
+        IssueClosPeerTableVisit<Profile>(p, peer, x.qp, x.phase, x.pending, wqe, slots);
+        remaining |= peer.cursor[x.qp] != peer.count[x.qp];
+    }
+    if (remaining) return false;
+    FlushClosPacket<Profile>(x.pending, s, slots);
+    if (++x.window < x.peer_count / x.visit_width) return false;
+    auto& lane = x.lane;
+    s.clos_table_owner = lane.owner;
+    for (uint32_t q = 0U; q < lane.count; ++q) {
+        auto& queue = lane.queues[q];
+        if (x.phase == 0U && !queue.critical_rows) continue;
+        auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(queue.state);
+        // Pressure checkpoints may retire earlier CQEs; snapshot the actual phase ticket.
         if (x.phase == 0U) {
-            PublishClosRelayAssist(s, lane.peers, x.peer_count, lane.queues, lane.count, x.group_offset,
-                                   lane.owner + x.qp * 8U);
+            queue.mid_ticket = state->cqe_cnt;
+        } else {
+            queue.final_ticket = state->cqe_cnt;
         }
+        DetailAdd<Profile>(s.detail, 4U, 1U);
+        aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kUdmaSyncSoCqeConfig>(
+            GetPeerCompletionFlag(s.rank, GetGroupRankIndex(queue.peer, s.world), 2U + 2U * x.qp, s.sync),
+            GetPeerCompletionFlag(s.rank, GetGroupRankIndex(queue.peer, s.world), kPeerCompletionValueSlot, s.sync),
+            reinterpret_cast<__ubuf__ uint64_t*>(wqe), 1U, queue.peer, DeepepTransportQp(s, queue.peer, x.qp),
+            EVENT_ID0);
+    }
+
+    if (x.phase == 0U) {
+        PublishClosRelayAssist(s, lane.peers, x.peer_count, lane.queues, lane.count, lane.owner + x.qp * 8U);
     }
     DispatchProfileMark<Profile>(s.profile, 9U + x.phase);
     ++x.phase;
@@ -855,26 +850,24 @@ __aicore__ inline bool StepClosSplit(ClosSplitState& x, DeepepPrimaryState& p, _
 template <bool Profile>
 __aicore__ inline void FinishClosSplit(ClosSplitState& x, DeepepSecondaryState& s)
 {
-    uint64_t seen[1]{};
+    uint64_t seen = 0U;
     uint64_t last_progress = AscendC::GetSystemCycle();
     for (;;) {
         bool done = true;
         bool progress = false;
-        for (uint32_t l = 0U; l < x.lane_count; ++l) {
-            auto& lane = x.lanes[l];
-            s.clos_table_owner = lane.owner;
-            for (uint32_t q = 0U; q < lane.count; ++q) {
-                auto& queue = lane.queues[q];
-                if (!(seen[l] & (uint64_t(1) << q)) &&
-                    ObserveClosPeerTableSoCqe<false>(queue.peer, DeepepTransportQp(s, queue.peer, x.qp), queue.state,
-                                                     queue.final_ticket)) {
-                    seen[l] |= uint64_t(1) << q;
-                    progress = true;
-                }
+        auto& lane = x.lane;
+        s.clos_table_owner = lane.owner;
+        for (uint32_t q = 0U; q < lane.count; ++q) {
+            auto& queue = lane.queues[q];
+            if (!(seen & (uint64_t(1) << q)) &&
+                ObserveClosPeerTableSoCqe<false>(queue.peer, DeepepTransportQp(s, queue.peer, x.qp), queue.state,
+                                                 queue.final_ticket)) {
+                seen |= uint64_t(1) << q;
+                progress = true;
             }
-            if (seen[l] != (lane.count ? UINT64_MAX >> (64U - lane.count) : 0U)) {
-                done = false;
-            }
+        }
+        if (seen != (lane.count ? UINT64_MAX >> (64U - lane.count) : 0U)) {
+            done = false;
         }
         if (done) {
             break;
@@ -884,60 +877,69 @@ __aicore__ inline void FinishClosSplit(ClosSplitState& x, DeepepSecondaryState& 
         } else {
             if (AscendC::GetSystemCycle() - last_progress >= kClosWaitTimeoutCycles) {
                 aclshmemi_kernel_abort("split-QP final CQ timeout rank=%u owner=%u qp=%u seen=%llu\n", s.rank,
-                                       x.lanes[0].owner, x.qp, static_cast<unsigned long long>(seen[0]));
+                                       x.lane.owner, x.qp, static_cast<unsigned long long>(seen));
                 return;
             }
             PauseClosAckPoll();
         }
     }
     DispatchProfileMark<Profile>(s.profile, 11U);
-    for (uint32_t l = 0U; l < x.lane_count; ++l) {
-        auto* ack = ClosRelayAssistOwner(s.clos_relay_mailbox, x.lanes[l].owner + x.qp * 8U) +
-                    ascend_deepep::kClosRelayAssistLineWords;
-        const uint64_t begin = AscendC::GetSystemCycle();
-        while (!ClosRelayAssistGeneration(ack, s.magic)) {
-            if (AscendC::GetSystemCycle() - begin >= kClosWaitTimeoutCycles) {
-                const uint32_t owner = x.lanes[l].owner;
-                auto* task0 = ClosRelayAssistOwner(s.clos_relay_mailbox, owner);
-                auto* task1 = ClosRelayAssistOwner(s.clos_relay_mailbox, owner + 8U);
-                ClosRelayAssistGeneration(task0, s.magic);
-                ClosRelayAssistGeneration(task1, s.magic);
-                auto* ack0 = task0 + ascend_deepep::kClosRelayAssistLineWords;
-                auto* ack1 = task1 + ascend_deepep::kClosRelayAssistLineWords;
-                ClosRelayAssistGeneration(ack0, s.magic);
-                ClosRelayAssistGeneration(ack1, s.magic);
-                aclshmemi_kernel_abort(
-                    "split-QP assist ACK timeout rank=%u owner=%u qp=%u generation=%llu "
-                    "published0=%llu published1=%llu ack0=%llu ack1=%llu\n",
-                    s.rank, owner, x.qp, static_cast<unsigned long long>(s.magic),
-                    static_cast<unsigned long long>(task0[0]), static_cast<unsigned long long>(task1[0]),
-                    static_cast<unsigned long long>(ack0[0]), static_cast<unsigned long long>(ack1[0]));
-                trap();
-                return;
-            }
-            PauseClosAckPoll();
+    auto* ack =
+        ClosRelayAssistOwner(s.clos_relay_mailbox, x.lane.owner + x.qp * 8U) + ascend_deepep::kClosRelayAssistLineWords;
+    const uint64_t begin = AscendC::GetSystemCycle();
+    while (!ClosRelayAssistGeneration(ack, s.magic)) {
+        if (AscendC::GetSystemCycle() - begin >= kClosWaitTimeoutCycles) {
+            const uint32_t owner = x.lane.owner;
+            auto* task0 = ClosRelayAssistOwner(s.clos_relay_mailbox, owner);
+            auto* task1 = ClosRelayAssistOwner(s.clos_relay_mailbox, owner + 8U);
+            ClosRelayAssistGeneration(task0, s.magic);
+            ClosRelayAssistGeneration(task1, s.magic);
+            auto* ack0 = task0 + ascend_deepep::kClosRelayAssistLineWords;
+            auto* ack1 = task1 + ascend_deepep::kClosRelayAssistLineWords;
+            ClosRelayAssistGeneration(ack0, s.magic);
+            ClosRelayAssistGeneration(ack1, s.magic);
+            aclshmemi_kernel_abort(
+                "split-QP assist ACK timeout rank=%u owner=%u qp=%u generation=%llu "
+                "published0=%llu published1=%llu ack0=%llu ack1=%llu\n",
+                s.rank, owner, x.qp, static_cast<unsigned long long>(s.magic),
+                static_cast<unsigned long long>(task0[0]), static_cast<unsigned long long>(task1[0]),
+                static_cast<unsigned long long>(ack0[0]), static_cast<unsigned long long>(ack1[0]));
+            trap();
+            return;
         }
+        PauseClosAckPoll();
     }
     DispatchProfileMark<Profile>(s.profile, 12U);
-    for (uint32_t l = 0U; l < x.lane_count; ++l) {
-        auto& lane = x.lanes[l];
-        s.clos_table_owner = lane.owner;
-        for (uint32_t q = 0U; q < lane.count; ++q) {
-            aclshmemx_udma_qp_quiet(lane.queues[q].peer, DeepepTransportQp(s, lane.queues[q].peer, x.qp));
-        }
+    auto& lane = x.lane;
+    s.clos_table_owner = lane.owner;
+    for (uint32_t q = 0U; q < lane.count; ++q) {
+        aclshmemx_udma_qp_quiet(lane.queues[q].peer, DeepepTransportQp(s, lane.queues[q].peer, x.qp));
     }
 }
 
-template <bool Profile, bool Fp8>
+template <bool Profile>
 __aicore__ inline void DispatchClosSplitQp(DeepepPrimaryState& p, __ubuf__ uint8_t* wqe,
-                                           AscendC::TBuf<AscendC::QuePosition::VECCALC>& /*copy*/,
+                                           AscendC::TBuf<AscendC::QuePosition::VECCALC>& copy,
                                            AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
 {
     ClosSplitState state;
     InitClosSplit<Profile>(state, p, slots);
     DispatchProfileMark<Profile>(p.secondary->profile, 8U);
-    while (!StepClosSplit<Profile, Fp8>(state, p, wqe, slots)) {
+    while (!StepClosSplit<Profile>(state, p, wqe, slots)) {
     }
     FinishClosSplit<Profile>(state, *p.secondary);
+    auto& s = *p.secondary;
+    auto targets = copy.Get<uint64_t>();
+    uint32_t count = 0U;
+    for (uint32_t j = 0U; j < state.peer_count; ++j) {
+        const uint32_t peer = state.lane.peers[j].peer;
+        if (peer / 8U == s.rank / 8U) continue;
+        // Empty destinations also publish, so receivers need no extra plan.
+        // Acquire their epoch before publishing into persistent control slots.
+        EnsureDeepepPeerAddress(s, peer);
+        targets.SetValue(count++, reinterpret_cast<uint64_t>(aclshmem_ptr(
+                                      DispatchCompletionFlag(s.completion, s.world, s.rank, state.qp), peer)));
+    }
+    PublishDispatchCompletionTargets(targets, count, s.magic, copy.GetWithOffset<uint64_t>(4U, 1024U));
     DispatchProfileMark<Profile>(p.secondary->profile, 13U);
 }

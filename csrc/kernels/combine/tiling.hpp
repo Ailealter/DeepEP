@@ -24,6 +24,24 @@ __aicore__
     return bytes <= combine_config::kGatewayControlUbBytes ? chunks : (chunks < 8U ? chunks : 8U);
 }
 static_assert(512U * 8U * 8U + 8U * 8U * 4U <= combine_config::kGatewayControlUbBytes);
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+__aicore__
+#endif
+    inline constexpr uint32_t
+    CombineReturnSlots(uint32_t world, uint32_t topk)
+{
+    const uint32_t servers = (world + 7U) / 8U;
+    return servers < topk ? topk : servers;
+}
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+__aicore__
+#endif
+    inline constexpr uint64_t
+    CombineReturnRow(int32_t token, uint32_t servers, uint32_t rank)
+{
+    // Test-only rank return plans encode an independent flat row as -row-1.
+    return token < 0 ? uint64_t(-int64_t(token) - 1) : uint64_t(token) * servers + rank / 8U;
+}
 namespace combine_control {
 constexpr uint32_t kSlotBytes = 512;
 // Per-chunk gather flags followed by per-reducer monotonic completion epochs.
@@ -223,8 +241,7 @@ struct PutCombineTiling {
     uint32_t rank_id, rank_num, token_num, hidden_size, expert_row_capacity, gather_row_capacity;
     uint32_t forward_row_capacity, backward_row_capacity;
     uint32_t chunk_token_num, chunks_per_group, total_chunk_num, control_slot_num;
-    uint64_t expert_input_offset_bytes, gather_input_offset_bytes, server_partial_offset_bytes,
-        returned_partial_offset_bytes, output_offset_bytes;
+    uint64_t gather_input_offset_bytes, server_partial_offset_bytes, returned_partial_offset_bytes, output_offset_bytes;
     uint32_t wait_credit;
     // One exclusive UDMA QP pair per cross PUT core (1..16).
     uint32_t num_cross_put_cores;
@@ -288,10 +305,10 @@ inline PutCombineTiling MakeCombineTiling(uint32_t rank, uint32_t world, uint32_
         cursor += (bytes + 511U) / 512U * 512U;
         return offset;
     };
-    t.expert_input_offset_bytes = reserve(uint64_t(rows) * hidden * 2U);
     t.gather_input_offset_bytes = reserve(uint64_t(gather_rows) * hidden * 2U);
     t.server_partial_offset_bytes = reserve(uint64_t(rows) * hidden * 2U);
-    t.returned_partial_offset_bytes = reserve(uint64_t(tokens) * ((world + 7U) / 8U) * hidden * 2U);
+    const uint32_t return_slots = ((world + 7U) / 8U < topk) ? topk : (world + 7U) / 8U;
+    t.returned_partial_offset_bytes = reserve(uint64_t(tokens) * return_slots * hidden * 2U);
     t.output_offset_bytes = reserve(uint64_t(tokens) * hidden * 2U);
     t.weight_topk = topk;
     t.weight_recv_offset_bytes = reserve(uint64_t(tokens) * topk * sizeof(float));

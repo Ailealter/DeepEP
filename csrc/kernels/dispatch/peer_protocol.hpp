@@ -13,11 +13,8 @@ namespace ascend_deepep {
 // peer0 word7, which EVERY AIV validates before the entry barrier.
 constexpr uint32_t kClosPeerTableOptionsWord = 12U;
 constexpr uint32_t kClosPeerTableOptionsLoadWords = 16U;  // Two aligned 32B headers.
-constexpr uint32_t kClosPeerTablePairedVf = 1U;
-constexpr uint32_t kClosPeerTablePodInterleave = 2U;
-// Independent A/B controls: a scale transport change must NOT silently reorder hidden.
+// Fixed schedule identifiers retained in the cached plan ABI.
 constexpr uint32_t kClosPeerTableBalancedLayout = 4U;
-constexpr uint32_t kClosPeerTableGroupOffset64 = 64U;
 constexpr uint32_t kClosPeerTableSplitQp = 128U;
 // One 32B descriptor: absolute hidden/weight/scale GM virtual addresses, then ready generation.
 // Uses the private C++ path's target-platform 32B visibility assumption.
@@ -28,6 +25,9 @@ constexpr uint32_t kPeerAddressRecordWords = 4U;
 constexpr uint32_t kPeerAddressGenerationWord = 3U;
 // Immutable local VF source, separate from every inbound descriptor/cache line.
 constexpr uint32_t kPeerAddressOutgoingBytes = 128U;
+// Independent final-completion words for Clos QP0, Clos QP1 and FM.
+// Each source/lane has one writer and a private 512B slot across generations.
+constexpr uint32_t kDispatchCompletionLanes = 3U;
 static_assert(kPeerAddressRecordWords * sizeof(uint64_t) == 32U);
 static_assert(kPeerAddressOutgoingBytes >= 64U && kPeerAddressOutgoingBytes + 32U <= kPeerAddressRowBytes);
 constexpr uint32_t kClosPeerTablePodStaged = 512U;
@@ -50,9 +50,6 @@ __aicore__
 {
     return peer % 8U;
 }
-constexpr uint32_t kClosScaleReadySchedule = 8U;
-constexpr uint32_t kClosScaleBalancedQp = 16U;
-constexpr uint32_t kClosScaleDedicatedJetty = 32U;
 static_assert(kClosPeerTableOptionsWord % 8U >= 4U && kClosPeerTableOptionsWord / 8U != 0U);
 static_assert(kClosPeerTableOptionsWord < kClosPeerTableOptionsLoadWords);
 // Handle-local mailbox appended to the two Notify tables. This is NOT
@@ -65,7 +62,7 @@ constexpr uint32_t kClosRelayAssistQueueWord = 2U * kClosRelayAssistLineWords;
 constexpr uint32_t kClosRelayAssistPeerWord = kClosRelayAssistQueueWord + kClosRelayAssistQueues * 4U;
 constexpr uint32_t kClosRelayAssistOwnerWords = kClosRelayAssistPeerWord + kClosRelayAssistPeers * 4U;
 constexpr uint32_t kClosRelayAssistBytes = kClosRelayAssistOwners * kClosRelayAssistOwnerWords * 8U;
-// Opt-in split-QP: one cache-line-isolated publisher per owner/QP. QP0 owns
+// One cache-line-isolated publisher per owner/QP. QP0 owns
 // tasks 0..7, QP1 owns tasks 8..15. No shared-writer task or queue state.
 constexpr uint32_t kClosSplitLinkWords = 16U * kClosRelayAssistPeers * 16U;
 constexpr uint32_t kClosSplitMailboxBytes = 2U * kClosRelayAssistBytes + kClosSplitLinkWords * 8U;
@@ -76,8 +73,8 @@ static_assert(kClosRelayAssistOwnerWords * 8U % 512U == 0U);
 // 14/15=observation scan numbers, 16=QP profile version 1. No layout growth.
 // split-qp uses version 2, word17=physical AIV, word18=logical QP; only that
 // QP's clocks are populated. Link profiles live in the separate suffix above.
-// BEFORE helper ACK, word3=EP64 group-offset membership, in generation's
-// cache line. AFTER ACK the owner may reuse word3 for its phase clock.
+// BEFORE helper ACK, word3 is reserved and zero. AFTER ACK the owner may
+// reuse word3 for its phase clock.
 // Queue record: {CQE address, old owner bit, physical QP, SO1 ticket}.
 // Peer record: {destination rank, queue index 0, queue index 1, reserved}.
 // Second line: generation ack (written LAST by AIV7), followed by profile clocks.

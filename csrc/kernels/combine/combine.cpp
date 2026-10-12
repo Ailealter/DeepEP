@@ -438,6 +438,7 @@ static_assert(kGatherBatchRows * kGatherTaskFields * sizeof(int64_t) <= kLocalCo
 constexpr aclshmemx_udma_op_config_t kPayloadRoNoCqeConfig{0U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
 constexpr aclshmemx_udma_op_config_t kPayloadRoConfig{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
 constexpr aclshmemx_udma_op_config_t kCompletionSoConfig{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_SO};
+#include "wqe_batch.hpp"
 enum class PartialClass : uint32_t { All, DirectOnly, ReducedOnly };
 // Control slots are 512B apart; each reducer publishes its own completion epoch.
 __aicore__ inline __gm__ uint64_t* Flag(GM_ADDR workspace, uint32_t flag_slot)
@@ -897,7 +898,7 @@ __aicore__ inline uint32_t AlignTaskToTokenBoundary(TaskReader& tasks, uint64_t 
     return tasks.GetValue((source_task_base + task_index - 1U) * 6U);
 }
 template <bool EnableTrace, bool EnableProfile>
-__aicore__ inline void ReduceGateway(GM_ADDR workspace, GlobalTensor<int32_t>& forward_list_gm,
+__aicore__ inline void ReduceGateway(GM_ADDR workspace, GM_ADDR input, GlobalTensor<int32_t>& forward_list_gm,
                                      LocalTensor<int32_t> chunk_ranges_ub, const CombineTiling& tiling,
                                      uint32_t group_index, uint32_t chunk_index, uint32_t reduce_core_index,
                                      uint32_t reduce_core_num, LocalTensor<bfloat16_t> bf16_input_ub,
@@ -960,9 +961,8 @@ __aicore__ inline void ReduceGateway(GM_ADDR workspace, GlobalTensor<int32_t>& f
                                                  : kReduceTileElements;
                 // 首份贡献直接初始化累加器，省去清零和首次加法。
                 GlobalTensor<bfloat16_t> primary_input_gm;
-                primary_input_gm.SetGlobalBuffer(
-                    reinterpret_cast<__gm__ bfloat16_t*>(workspace + tiling.expert_input_offset_bytes) +
-                    uint64_t(primary_row) * tiling.hidden_size + hidden_offset);
+                primary_input_gm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(input) +
+                                                 uint64_t(primary_row) * tiling.hidden_size + hidden_offset);
                 DataCopy(bf16_input_ub, primary_input_gm, element_num);
                 SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
                 WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
@@ -1000,9 +1000,8 @@ __aicore__ inline void ReduceGateway(GM_ADDR workspace, GlobalTensor<int32_t>& f
                     const bool is_local_contribution = uint32_t(contributor_rank) == tiling.rank_id;
                     const uint32_t contributor_row = tasks.GetValue((source_task_base + contributor_task_index) * 6U +
                                                                     (is_local_contribution ? 4U : 5U));
-                    AddBf16(reinterpret_cast<__gm__ bfloat16_t*>(workspace + (is_local_contribution
-                                                                                  ? tiling.expert_input_offset_bytes
-                                                                                  : tiling.gather_input_offset_bytes)) +
+                    AddBf16(reinterpret_cast<__gm__ bfloat16_t*>(
+                                (is_local_contribution ? input : workspace + tiling.gather_input_offset_bytes)) +
                                 uint64_t(contributor_row) * tiling.hidden_size + hidden_offset,
                             element_num, bf16_input_ub, fp32_input_ub, fp32_accumulator_ub);
                 }
@@ -1045,7 +1044,11 @@ __aicore__ inline void ReduceGateway(GM_ADDR workspace, GlobalTensor<int32_t>& f
 }
 __aicore__ inline bool UseLocalMte(uint32_t rank_num)
 {
+#ifdef DEEPEP_COMBINE_EP8_MTE
+    return true;
+#else
     return rank_num >= 64U;
+#endif
 }
 // Local/MESH copies use separate payload banks, never the gather metadata UB.
 __aicore__ inline GM_ADDR LocalMteDestination(GM_ADDR address, uint32_t peer, uint32_t self)
@@ -1106,32 +1109,19 @@ __aicore__ inline void PublishLocalMteFlag(__gm__ uint64_t* flag, uint32_t peer,
     StoreFlag(reinterpret_cast<__gm__ uint64_t*>(remote), signal_ub, 1U);
 }
 template <bool EnableTrace>
-__aicore__ inline void SendPartial(GM_ADDR workspace, GlobalTensor<int32_t>& forward_list_gm,
+__aicore__ inline void SendPartial(GM_ADDR workspace, GM_ADDR input, GlobalTensor<int32_t>& forward_list_gm,
                                    const CombineTiling& tiling, uint32_t destination_rank, uint32_t task_begin,
                                    uint32_t task_end, LocalTensor<uint8_t> copy_ub, __ubuf__ uint8_t* wqe_scratch_ub,
                                    Trace<EnableTrace>& trace_recorder, uint32_t trace_slot, uint32_t chunk_slot = ~0U,
                                    PartialClass partial_class = PartialClass::All, uint32_t jetty_id = 0U,
                                    bool cross_put = false)
 {
-    const uint32_t server_num = (tiling.rank_num + 7U) / 8U;
+    const uint32_t server_num = ascend_deepep::CombineReturnSlots(tiling.rank_num, tiling.weight_topk);
     const uint64_t source_task_base = uint64_t(destination_rank) * tiling.forward_row_capacity;
     const bool remote_destination = destination_rank != tiling.rank_id;
     const bool use_mte = UseLocalMte(tiling.rank_num) || !remote_destination;
-    uint32_t remaining_rows = 0, pending_wqes = 0;
-    aclshmemx_submit_state_t submit_state{};
-    aclshmemx_defer_t defer(submit_state);
-    aclshmemx_submit_t submit(submit_state);
-    if (!use_mte) {
-        // Close every filtered stream's tail, including a partial QP0 batch.
-        for (uint32_t scan = task_begin; scan < task_end;) {
-            const bool reduced = TokenNeedsGatewayReduce(forward_list_gm, source_task_base, scan);
-            if ((partial_class != PartialClass::DirectOnly || !reduced) &&
-                (partial_class != PartialClass::ReducedOnly || reduced)) {
-                ++remaining_rows;
-            }
-            scan = forward_list_gm.GetValue((source_task_base + scan) * 6U);
-        }
-    }
+    LocalPutBatch batch;
+    if (!use_mte) batch.Init(workspace, destination_rank, tiling.hidden_size * 2U, wqe_scratch_ub);
     uint32_t rows = 0;
     LocalMteCopy copy;
     if (use_mte) {
@@ -1145,29 +1135,23 @@ __aicore__ inline void SendPartial(GM_ADDR workspace, GlobalTensor<int32_t>& for
             task_index = token_end;
             continue;
         }
-        const uint32_t token_id = forward_list_gm.GetValue((source_task_base + task_index) * 6U + 1U);
+        const int32_t token_id = forward_list_gm.GetValue((source_task_base + task_index) * 6U + 1U);
+#ifdef DEEPEP_COMBINE_EP8_MTE
+        if (token_id >= 0) {
+            aclshmemi_kernel_abort("EP8 MTE requires rank-return metadata\n");
+        }
+#endif
         const uint32_t primary_row = forward_list_gm.GetValue((source_task_base + task_index) * 6U + 2U);
-        auto* source_address = workspace +
-                               (needs_reduce ? tiling.server_partial_offset_bytes : tiling.expert_input_offset_bytes) +
+        auto* source_address = (needs_reduce ? workspace + tiling.server_partial_offset_bytes : input) +
                                uint64_t(primary_row) * tiling.hidden_size * 2U;
-        auto* destination_address = workspace + tiling.returned_partial_offset_bytes +
-                                    (uint64_t(token_id) * server_num + tiling.rank_id / 8U) * tiling.hidden_size * 2U;
+        auto* destination_address =
+            workspace + tiling.returned_partial_offset_bytes +
+            ascend_deepep::CombineReturnRow(token_id, server_num, tiling.rank_id) * tiling.hidden_size * 2U;
         if (use_mte) {
             copy.Add(LocalMteDestination(destination_address, destination_rank, tiling.rank_id), source_address,
                      tiling.hidden_size * 2U, copy_ub);
         } else {
-            const bool close_batch = --remaining_rows == 0U || pending_wqes + 1U == kWqeBatchSize;
-            if (close_batch) {
-                aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_MTE3, kPayloadRoConfig>(
-                    destination_address, source_address, wqe_scratch_ub, tiling.hidden_size * 2U, destination_rank, 0U,
-                    EVENT_ID0, submit);
-                pending_wqes = 0;
-            } else {
-                aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_MTE3, kPayloadRoNoCqeConfig>(
-                    destination_address, source_address, wqe_scratch_ub, tiling.hidden_size * 2U, destination_rank, 0U,
-                    EVENT_ID0, defer);
-                ++pending_wqes;
-            }
+            batch.Add(destination_address, source_address);
         }
         if constexpr (EnableTrace) {
             ++rows;
@@ -1176,6 +1160,8 @@ __aicore__ inline void SendPartial(GM_ADDR workspace, GlobalTensor<int32_t>& for
     }
     if (use_mte) {
         copy.Finish();
+    } else {
+        batch.Flush();
     }
     if constexpr (EnableTrace) {
         for (uint32_t index = 0; index < 2U; ++index) {
@@ -1348,6 +1334,11 @@ __aicore__ inline void WaitSourceChunk(GM_ADDR workspace, const CombineTiling& t
                                        Profile<EnableProfile>& profile)
 {
     const uint32_t window_end = SoWindowEnd(tiling, chunk);
+#ifdef DEEPEP_COMBINE_EP8_MTE
+    const uint32_t self_copy_core = tiling.rank_id * 4U;
+#else
+    const uint32_t self_copy_core = tiling.rank_id % 8U;
+#endif
     trace_recorder.Reset(combine_profile::ChunkSlot, combine_profile::SourceChunk);
     trace_recorder.Set(combine_profile::ChunkSlot, combine_profile::ChunkIndex, window_end);
     trace_recorder.Mark(combine_profile::ChunkSlot, combine_profile::Begin);
@@ -1356,7 +1347,7 @@ __aicore__ inline void WaitSourceChunk(GM_ADDR workspace, const CombineTiling& t
         profile.waits = 0;
         for (uint32_t gateway = core_id; gateway < tiling.rank_num; gateway += combine_config::kAivCores) {
             if (gateway == tiling.rank_id) {
-                profile.WaitAdd(gateway, window_end, 0U, ~0U, SelfCopyDoneSlot(tiling, tiling.rank_id % 8U),
+                profile.WaitAdd(gateway, window_end, 0U, ~0U, SelfCopyDoneSlot(tiling, self_copy_core),
                                 window_end + 1U);
                 continue;
             }
@@ -1398,7 +1389,7 @@ __aicore__ inline void WaitSourceChunk(GM_ADDR workspace, const CombineTiling& t
     } else {
         for (uint32_t gateway = core_id; gateway < tiling.rank_num; gateway += combine_config::kAivCores) {
             if (gateway == tiling.rank_id) {
-                WaitCompletionFlags(workspace, SelfCopyDoneSlot(tiling, tiling.rank_id % 8U), 1U, signal_ub,
+                WaitCompletionFlags(workspace, SelfCopyDoneSlot(tiling, self_copy_core), 1U, signal_ub,
                                     window_end + 1U);
             } else {
                 WaitGatewayWindow(workspace, tiling, gateway, chunk, signal_ub);
@@ -1448,8 +1439,12 @@ __aicore__ inline bool IsCrossPhysicalCore(const CombineTiling& tiling, uint32_t
 // Gateway reducers follow the contiguous cross pool.
 __aicore__ inline uint32_t ReduceLogicalIndex(const CombineTiling& tiling, uint32_t core_id)
 {
+#ifdef DEEPEP_COMBINE_EP8_MTE
+    return core_id - 32U;
+#else
     const uint32_t cross_count = tiling.rank_num > 8U ? tiling.num_cross_put_cores : 0U;
     return core_id - 8U - cross_count;
+#endif
 }
 
 struct CrossQuietPlan {
@@ -1493,6 +1488,14 @@ struct CrossPutBatch {
     uint32_t so_reserve = 1;
     __gm__ uint64_t* credit_source = nullptr;
     __gm__ uint64_t* credit_sink[2]{};
+    GM_ADDR workspace = nullptr;
+
+    __aicore__ inline void BuildLane(uint32_t lane, uint32_t row_bytes, __ubuf__ uint8_t* scratch)
+    {
+        auto* output = scratch + lane * kWqeBatchScratchBytes;
+        BuildCombinePutWqes(output, reinterpret_cast<__ubuf__ uint64_t*>(output + kCrossDescriptorsOffset),
+                            state[lane].pending_count, row_bytes);
+    }
 
     __aicore__ inline void FlushLane(uint32_t lane, uint32_t owner, __ubuf__ uint8_t* scratch)
     {
@@ -1570,12 +1573,14 @@ struct CrossPutBatch {
 
     __aicore__ inline void Flush(uint32_t owner, uint32_t row_bytes, __ubuf__ uint8_t* scratch)
     {
+        BuildLane(0U, row_bytes, scratch);
         FlushLane(0U, owner, scratch);
+        BuildLane(1U, row_bytes, scratch);
         FlushLane(1U, owner, scratch);
     }
 
     __aicore__ inline void Add(GM_ADDR dst, GM_ADDR src, uint32_t target, uint32_t lane, uint32_t owner,
-                               uint32_t row_bytes, __ubuf__ uint8_t* scratch, bool reduced)
+                               uint32_t row_bytes, __ubuf__ uint8_t* scratch, bool reduced, uint32_t header_index)
     {
         if constexpr (Enabled) {
             if (reduced)
@@ -1583,11 +1588,17 @@ struct CrossPutBatch {
             else
                 ++direct_rows[lane];
         }
-        auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(dst, target));
-        aclshmemi_udma_stage_send_wqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kPayloadRoNoCqeConfig>(
-            remote, src, target, 2U * owner + lane, row_bytes, scratch + lane * kWqeBatchScratchBytes, state[lane]);
+        auto* header = CrossPutHeader(scratch, lane, header_index);
+        auto* descriptor =
+            reinterpret_cast<__ubuf__ uint64_t*>(scratch + lane * kWqeBatchScratchBytes + kCrossDescriptorsOffset) +
+            state[lane].pending_count * 4U;
+        descriptor[0] = reinterpret_cast<uint64_t>(src);
+        descriptor[1] = header[7] + uint64_t(dst - workspace);
+        descriptor[2] = reinterpret_cast<uint64_t>(header);
+        ++state[lane].pending_count;
         peer[lane] = target;
         if (state[lane].pending_count == 32U) {
+            BuildLane(lane, row_bytes, scratch);
             FlushLane(lane, owner, scratch);
         }
     }
@@ -1637,7 +1648,7 @@ __aicore__ inline void LoadCrossChunkRanges(LocalTensor<int32_t> ranges_ub, Glob
 }
 
 template <bool EnableTrace, bool EnableProfile>
-__aicore__ inline void CrossSend(GM_ADDR workspace, GlobalTensor<int32_t>& forward_list_gm,
+__aicore__ inline void CrossSend(GM_ADDR workspace, GM_ADDR input, GlobalTensor<int32_t>& forward_list_gm,
                                  GlobalTensor<int32_t>& chunk_ranges_gm, const CombineTiling& tiling, uint32_t core_id,
                                  uint32_t reduce_core_num, LocalTensor<uint8_t> copy_ub,
                                  LocalTensor<uint64_t> signal_ub, LocalTensor<int32_t> reduce_done_ub,
@@ -1647,7 +1658,7 @@ __aicore__ inline void CrossSend(GM_ADDR workspace, GlobalTensor<int32_t>& forwa
 {
     const uint64_t peer_setup_begin = profile.Clock();
     const uint32_t owner = CrossLogicalOwner(tiling, core_id);
-    const uint32_t server_num = (tiling.rank_num + 7U) / 8U;
+    const uint32_t server_num = ascend_deepep::CombineReturnSlots(tiling.rank_num, tiling.weight_topk);
     const uint32_t row_bytes = tiling.hidden_size * 2U;
     uint32_t peer_indices[128];
     auto& all_peers = quiet_plan.peers;
@@ -1655,6 +1666,10 @@ __aicore__ inline void CrossSend(GM_ADDR workspace, GlobalTensor<int32_t>& forwa
     uint32_t peer_count = BuildCrossPeerList(tiling, owner, all_peers);
     quiet_plan.count = peer_count;
     const uint32_t all_peer_count = peer_count;
+    if (all_peer_count > kCrossHeaderCapacity) {
+        aclshmemi_kernel_abort("PUT combine cross header cache capacity exceeded\n");
+        return;
+    }
     for (uint32_t index = 0; index < all_peer_count; ++index) {
         // Both lane scanners retain the same token ordinal across this peer's
         // chunks. Group-local indices are reused and must not own this state.
@@ -1679,6 +1694,8 @@ __aicore__ inline void CrossSend(GM_ADDR workspace, GlobalTensor<int32_t>& forwa
                     owner, lane, peer);
             }
         }
+        CacheCombinePutHeader(CrossPutHeader(wqe_scratch_ub, 0U, index), workspace, peer, 2U * owner);
+        CacheCombinePutHeader(CrossPutHeader(wqe_scratch_ub, 1U, index), workspace, peer, 2U * owner + 1U);
         auto* lane0 = aclshmemi_udma_get_qp_ctx(info, peer, 2U * owner);
         auto* lane1 = aclshmemi_udma_get_qp_ctx(info, peer, 2U * owner + 1U);
         if (lane0->state_addr == lane1->state_addr) {
@@ -1688,6 +1705,7 @@ __aicore__ inline void CrossSend(GM_ADDR workspace, GlobalTensor<int32_t>& forwa
     profile.Elapsed(diagnostics::CrossPeerSetupTicks, peer_setup_begin);
     CrossPutBatch<EnableProfile> batch;
     batch.profile = &profile;
+    batch.workspace = workspace;
     batch.credit_source = Flag(workspace, 3U * tiling.rank_num + core_id);
     for (uint32_t lane = 0U; lane < 2U; ++lane) {
         // Slot padding is private to (gateway, owner, lane) at each receiver.
@@ -1828,15 +1846,13 @@ __aicore__ inline void CrossSend(GM_ADDR workspace, GlobalTensor<int32_t>& forwa
                             if (token_lane != lane) {
                                 continue;
                             }
-                            const uint32_t token = forward_list_gm.GetValue((base + begin) * 6U + 1U);
+                            const int32_t token = forward_list_gm.GetValue((base + begin) * 6U + 1U);
                             const uint32_t primary = forward_list_gm.GetValue((base + begin) * 6U + 2U);
                             const bool reduced = TokenNeedsGatewayReduce(forward_list_gm, base, begin);
-                            auto* src =
-                                workspace +
-                                (reduced ? tiling.server_partial_offset_bytes : tiling.expert_input_offset_bytes) +
-                                uint64_t(primary) * row_bytes;
+                            auto* src = (reduced ? workspace + tiling.server_partial_offset_bytes : input) +
+                                        uint64_t(primary) * row_bytes;
                             auto* dst = workspace + tiling.returned_partial_offset_bytes +
-                                        (uint64_t(token) * server_num + tiling.rank_id / 8U) * row_bytes;
+                                        ascend_deepep::CombineReturnRow(token, server_num, tiling.rank_id) * row_bytes;
                             if (reduced) {
                                 if (!reduced_rows++) {
                                     trace_recorder.First(combine_profile::PeerSlotBase,
@@ -1848,7 +1864,8 @@ __aicore__ inline void CrossSend(GM_ADDR workspace, GlobalTensor<int32_t>& forwa
                                                          combine_profile::CrossDirectFirstIssue);
                                 }
                             }
-                            batch.Add(dst, src, peer, lane, owner, row_bytes, wqe_scratch_ub, reduced);
+                            batch.Add(dst, src, peer, lane, owner, row_bytes, wqe_scratch_ub, reduced,
+                                      peer_indices[index]);
                             profile.First(reduced ? diagnostics::FirstReducedIssue : diagnostics::FirstDirectIssue);
                             ++sent;
                         }
@@ -2012,11 +2029,11 @@ __aicore__ inline void PublishWeightDone(GM_ADDR workspace, const CombineTiling&
 }
 
 template <bool EnableTrace, bool EnableProfile = false>
-__aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR forward_counts, GM_ADDR backward_list,
-                               GM_ADDR backward_counts, GM_ADDR token_server_mask, GM_ADDR chunk_ranges,
-                               GM_ADDR chunk_masks, GM_ADDR trace_buffer, GM_ADDR weights, GM_ADDR weight_meta,
-                               const CombineTiling& tiling, GM_ADDR profile_buffer = nullptr, uint64_t sample = 0,
-                               GM_ADDR chunk_profile = nullptr, GM_ADDR peer_profile = nullptr)
+__aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward_list, GM_ADDR forward_counts,
+                               GM_ADDR backward_list, GM_ADDR backward_counts, GM_ADDR token_server_mask,
+                               GM_ADDR chunk_ranges, GM_ADDR chunk_masks, GM_ADDR trace_buffer, GM_ADDR weights,
+                               GM_ADDR weight_meta, const CombineTiling& tiling, GM_ADDR profile_buffer = nullptr,
+                               uint64_t sample = 0, GM_ADDR chunk_profile = nullptr, GM_ADDR peer_profile = nullptr)
 {
     static_assert(!(EnableTrace && EnableProfile), "Legacy and diagnostic UB are mutually exclusive");
     uint64_t entry_cycle = 0;
@@ -2024,24 +2041,32 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
         entry_cycle = GetSystemCycle();
     }
     const uint32_t core_id = GetBlockIdx(), local_rank_num = tiling.rank_num < 8U ? tiling.rank_num : 8U;
-    const uint32_t server_num = (tiling.rank_num + 7U) / 8U;
+    const uint32_t server_num = ascend_deepep::CombineReturnSlots(tiling.rank_num, tiling.weight_topk);
     const uint32_t group_num = tiling.rank_num / tiling.group_size;
     // Each cross owner has an exclusive QP pair across all remote peers.
     const uint32_t cross_sender_num = tiling.rank_num <= 8U ? 0U : tiling.num_cross_put_cores;
-    const uint32_t reduce_core_begin = 8U + cross_sender_num;
+#ifdef DEEPEP_COMBINE_EP8_MTE
+    const uint32_t local_sender_num = 32U, reduce_core_begin = 32U;
+#else
+    const uint32_t local_sender_num = local_rank_num, reduce_core_begin = 8U + cross_sender_num;
+#endif
     const uint32_t reduce_core_num = combine_config::kAivCores - reduce_core_begin;
     const bool is_cross_sender = IsCrossPhysicalCore(tiling, core_id);
     CrossQuietPlan quiet_plan;
+#ifdef DEEPEP_COMBINE_EP8_MTE
+    const bool is_reduce_core = core_id >= reduce_core_begin && core_id < combine_config::kAivCores;
+#else
     const bool is_reduce_core = core_id >= 8U && core_id < combine_config::kAivCores && !is_cross_sender;
+#endif
     const uint32_t reduce_core_index = is_reduce_core ? ReduceLogicalIndex(tiling, core_id) : 0U;
     TPipe pipe;
     Profile<EnableProfile> profile;
     const uint64_t profile_entry = profile.Clock();
     profile.Init(pipe, profile_buffer, sample, tiling, core_id,
-                 core_id < local_rank_num ? diagnostics::Local
-                 : is_cross_sender        ? diagnostics::Cross
-                 : is_reduce_core         ? diagnostics::Gateway
-                                          : diagnostics::Idle,
+                 core_id < local_sender_num ? diagnostics::Local
+                 : is_cross_sender          ? diagnostics::Cross
+                 : is_reduce_core           ? diagnostics::Gateway
+                                            : diagnostics::Idle,
                  chunk_profile, peer_profile);
     profile.Set(diagnostics::Begin, profile_entry);
     Trace<EnableTrace> trace_recorder;
@@ -2082,6 +2107,11 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
     forward_list_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(forward_list));
     forward_counts_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(forward_counts));
     backward_counts_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(backward_counts));
+#ifdef DEEPEP_COMBINE_EP8_MTE
+    if (tiling.rank_num != 8U || (core_id < 8U && backward_counts_gm.GetValue(core_id) != 0)) {
+        aclshmemi_kernel_abort("EP8 MTE requires rank-return metadata without gather tasks\n");
+    }
+#endif
     chunk_ranges_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunk_ranges));
     auto gateway_controls_ub = copy_buffer.Get<int32_t>()[combine_config::kGatewayScratchBytes / sizeof(int32_t)];
     if (is_reduce_core) {
@@ -2098,9 +2128,18 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
     }
     profile.Mark(diagnostics::WeightSendEnd);
     profile.Mark(diagnostics::ProducerBegin);
+#ifdef DEEPEP_COMBINE_EP8_MTE
+    if (core_id < local_sender_num) {
+        profile.Set(diagnostics::GatherEnd, profile.Get(diagnostics::ProducerBegin));
+    }
+#endif
     const bool local_mte = UseLocalMte(tiling.rank_num);
     // Each local core owns one MESH peer's QP0 or MTE stream, including its final drain.
+#ifdef DEEPEP_COMBINE_EP8_MTE
+    if (false) {
+#else
     if (core_id < local_rank_num) {
+#endif
         trace_recorder.Mark(combine_profile::SummarySlot, combine_profile::GatherBegin);
         const uint32_t peer_rank = tiling.rank_id / 8U * 8U + core_id;
         const uint32_t task_num = backward_counts_gm.GetValue(core_id);
@@ -2116,9 +2155,8 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
         if (local_mte) {
             gather_copy.Init();
         }
-        aclshmemx_submit_state_t gather_submit_state{};
-        aclshmemx_defer_t gather_defer(gather_submit_state);
-        aclshmemx_submit_t gather_submit(gather_submit_state);
+        LocalPutBatch gather_batch;
+        if (!local_mte) gather_batch.Init(workspace, peer_rank, tiling.hidden_size * 2U, wqe_scratch_ub);
         uint32_t batch_start = 0;
         bool chunk_open = false;
         uint32_t chunk_task_num = 0;
@@ -2167,20 +2205,13 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
                 auto* destination_address =
                     workspace + tiling.gather_input_offset_bytes + uint64_t(reduce_row) * tiling.hidden_size * 2U;
                 auto* source_address =
-                    workspace + tiling.expert_input_offset_bytes +
-                    uint64_t(gather_tasks_ub.GetValue(task_word_offset + 1U)) * tiling.hidden_size * 2U;
+                    input + uint64_t(gather_tasks_ub.GetValue(task_word_offset + 1U)) * tiling.hidden_size * 2U;
                 if (local_mte) {
                     gather_copy.Add(LocalMteDestination(destination_address, peer_rank, tiling.rank_id), source_address,
                                     tiling.hidden_size * 2U, copy_ub);
-                } else if (chunk_end_id != 0U || task_index + 1U == loaded_rows) {
-                    // Submit every chunk or metadata-batch tail with one payload CQE.
-                    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_MTE3, kPayloadRoConfig>(
-                        destination_address, source_address, wqe_scratch_ub, tiling.hidden_size * 2U, peer_rank, 0U,
-                        EVENT_ID0, gather_submit);
                 } else {
-                    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_MTE3, kPayloadRoNoCqeConfig>(
-                        destination_address, source_address, wqe_scratch_ub, tiling.hidden_size * 2U, peer_rank, 0U,
-                        EVENT_ID0, gather_defer);
+                    gather_batch.Add(destination_address, source_address);
+                    if (chunk_end_id != 0U || task_index + 1U == loaded_rows) gather_batch.Flush();
                 }
                 ++batch_rows;
                 if (chunk_end_id) {
@@ -2292,7 +2323,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
                 const uint64_t old_rows = profile.Get(diagnostics::GatewayRows);
                 const uint64_t reduce_begin = profile.Clock();
                 trace_recorder.Mark(combine_profile::ChunkSlot, combine_profile::GatewayChunkReduceBegin);
-                ReduceGateway(workspace, forward_list_gm, gateway_controls_ub, tiling, group_index, chunk_index,
+                ReduceGateway(workspace, input, forward_list_gm, gateway_controls_ub, tiling, group_index, chunk_index,
                               reduce_core_index, reduce_core_num, bf16_input_ub, fp32_input_ub, fp32_accumulator_ub,
                               bf16_output_ub, copy_buffer.Get<int32_t>(), trace_recorder, profile);
                 // Empty reducers publish too; only this reducer writes its slot.
@@ -2314,10 +2345,14 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
     if (tiling.with_weights && is_reduce_core && reduce_core_index == 0U) {
         PublishWeightDone(workspace, tiling, reduce_core_num);
     }
-    if (core_id < local_rank_num) {
+    if (core_id < local_sender_num) {
         // All gather submissions finish first to avoid blocking a later group's
         // inputs while waiting for this local return's reduce_done.
+#ifdef DEEPEP_COMBINE_EP8_MTE
+        const uint32_t peer_rank = core_id / 4U, copy_lane = core_id % 4U;
+#else
         const uint32_t peer_rank = tiling.rank_id / 8U * 8U + core_id;
+#endif
         const uint32_t local_group = CombineGroup(tiling.rank_id, tiling.rank_num, peer_rank, tiling.group_size);
         trace_recorder.Mark(combine_profile::SummarySlot, combine_profile::LocalReturnBegin);
         profile.Mark(diagnostics::LocalReturnBegin);
@@ -2344,7 +2379,17 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
                        reinterpret_cast<__gm__ int32_t*>(chunk_ranges) +
                            (uint64_t(peer_rank) * tiling.chunks_per_group + chunk_index) * 2U,
                        2U);
+#ifdef DEEPEP_COMBINE_EP8_MTE
+            const uint32_t chunk_begin = range_ub.GetValue(0), chunk_end = range_ub.GetValue(1);
+            const uint64_t task_count = chunk_end - chunk_begin;
+            const uint64_t task_base = uint64_t(peer_rank) * tiling.forward_row_capacity;
+            const uint32_t task_begin = AlignTaskToTokenBoundary(forward_list_gm, task_base, chunk_begin,
+                                                                 chunk_begin + task_count * copy_lane / 4U);
+            const uint32_t task_end = AlignTaskToTokenBoundary(forward_list_gm, task_base, chunk_begin,
+                                                               chunk_begin + task_count * (copy_lane + 1U) / 4U);
+#else
             const uint32_t task_begin = range_ub.GetValue(0), task_end = range_ub.GetValue(1);
+#endif
             profile.ChunkMark(chunks::Ready);
             profile.ChunkMark(chunks::WorkBegin);
             profile.ChunkSet(chunks::Rows, task_end - task_begin);
@@ -2353,9 +2398,27 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
                 trace_recorder.First(combine_profile::SummarySlot, combine_profile::SelfCopyBegin);
             }
             trace_recorder.Mark(combine_profile::PeerSlotBase, combine_profile::Begin);
-            SendPartial(workspace, forward_list_gm, tiling, peer_rank, task_begin, task_end, copy_ub, wqe_scratch_ub,
-                        trace_recorder, combine_profile::PeerSlotBase);
+            SendPartial(workspace, input, forward_list_gm, tiling, peer_rank, task_begin, task_end, copy_ub,
+                        wqe_scratch_ub, trace_recorder, combine_profile::PeerSlotBase);
             trace_recorder.Mark(combine_profile::PeerSlotBase, combine_profile::End);
+#ifdef DEEPEP_COMBINE_EP8_MTE
+            if (chunk_index == SoWindowEnd(tiling, chunk_index)) {
+                // SendPartial drains both MTE banks before any epoch is published.
+                if (copy_lane != 0U) {
+                    StoreFlag(Flag(workspace, SelfCopyDoneSlot(tiling, core_id)), signal_ub, chunk_index + 1U);
+                } else {
+                    WaitCompletionFlags(workspace, SelfCopyDoneSlot(tiling, core_id + 1U), 3U, signal_ub,
+                                        chunk_index + 1U);
+                    if (peer_rank == tiling.rank_id) {
+                        StoreFlag(Flag(workspace, SelfCopyDoneSlot(tiling, core_id)), signal_ub, chunk_index + 1U);
+                    } else {
+                        PublishLocalMteFlag(
+                            Flag(workspace, CrossCompletionSlot(tiling, tiling.rank_id, chunk_index, 0U)), peer_rank,
+                            tiling.rank_id, signal_ub);
+                    }
+                }
+            }
+#else
             if (peer_rank != tiling.rank_id) {
                 if (chunk_index == SoWindowEnd(tiling, chunk_index)) {
                     // Distinct immutable-one destinations at window tails, even if empty.
@@ -2380,6 +2443,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
                 trace_recorder.Mark(combine_profile::PeerSlotBase, combine_profile::End);
                 trace_recorder.Mark(combine_profile::SummarySlot, combine_profile::SelfCopyEnd);
             }
+#endif
             profile.ChunkMark(chunks::WorkEnd);
             profile.ChunkEnd();
             trace_recorder.Save(combine_profile::PeerSlotBase, trace_recorder.ChunkRecordIndex(chunk_index, 3U));
@@ -2388,9 +2452,9 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
         profile.Mark(diagnostics::LocalReturnEnd);
     } else if (is_cross_sender) {
         trace_recorder.Mark(combine_profile::SummarySlot, combine_profile::CrossReturnTotalBegin);
-        CrossSend(workspace, forward_list_gm, chunk_ranges_gm, tiling, core_id, reduce_core_num, copy_ub, signal_ub,
-                  copy_buffer.Get<int32_t>(), bf16_input_buffer.Get<int32_t>(), wqe_scratch_ub, trace_recorder,
-                  quiet_plan, profile);
+        CrossSend(workspace, input, forward_list_gm, chunk_ranges_gm, tiling, core_id, reduce_core_num, copy_ub,
+                  signal_ub, copy_buffer.Get<int32_t>(), bf16_input_buffer.Get<int32_t>(), wqe_scratch_ub,
+                  trace_recorder, quiet_plan, profile);
     }
     profile.Mark(diagnostics::ProducerEnd);
     profile.Mark(diagnostics::SourceBegin);
@@ -2606,7 +2670,8 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR forward_list, GM_ADDR 
 __aicore__ inline void Prepare(GM_ADDR, const CombineTiling&) {}
 template <bool EnableTrace, bool EnableProfile = false>
 __aicore__ inline void Combine(GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-                               GM_ADDR, const CombineTiling&, GM_ADDR = nullptr, uint64_t = 0, GM_ADDR = nullptr)
+                               GM_ADDR, GM_ADDR, const CombineTiling&, GM_ADDR = nullptr, uint64_t = 0,
+                               GM_ADDR = nullptr, GM_ADDR = nullptr)
 {
 }
 #endif
@@ -2622,12 +2687,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_prep
 #endif
 }
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_kernel(
-    GM_ADDR workspace, GM_ADDR forward, GM_ADDR counts, GM_ADDR backward, GM_ADDR backward_counts, GM_ADDR mask,
-    GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta, ascend_deepep::PutCombineTiling tiling)
+    GM_ADDR workspace, GM_ADDR input, GM_ADDR forward, GM_ADDR counts, GM_ADDR backward, GM_ADDR backward_counts,
+    GM_ADDR mask, GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta,
+    ascend_deepep::PutCombineTiling tiling)
 {
     util_set_ffts_config(0U);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Combine<false>(workspace, forward, counts, backward, backward_counts, mask, ranges, masks, nullptr, weights,
+    Combine<false>(workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, nullptr, weights,
                    weight_meta, tiling);
 #endif
 }
@@ -2635,35 +2701,36 @@ extern "C" ASCEND_DEEPEP_EXPORT void combine_prepare_kernel_do(void* stream, uin
 {
     combine_prepare_kernel<<<64, 0, stream>>>(workspace, *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling));
 }
-extern "C" ASCEND_DEEPEP_EXPORT void combine_kernel_do(void* stream, uint8_t* workspace, uint8_t* forward,
-                                                       uint8_t* counts, uint8_t* backward, uint8_t* backward_counts,
-                                                       uint8_t* mask, uint8_t* ranges, uint8_t* masks, uint8_t* weights,
-                                                       uint8_t* weight_meta, uint8_t* tiling)
+extern "C" ASCEND_DEEPEP_EXPORT void combine_kernel_do(void* stream, uint8_t* workspace, uint8_t* input,
+                                                       uint8_t* forward, uint8_t* counts, uint8_t* backward,
+                                                       uint8_t* backward_counts, uint8_t* mask, uint8_t* ranges,
+                                                       uint8_t* masks, uint8_t* weights, uint8_t* weight_meta,
+                                                       uint8_t* tiling)
 {
     combine_kernel<<<64, ascend_deepep::combine_config::kLaunchUbBytes, stream>>>(
-        workspace, forward, counts, backward, backward_counts, mask, ranges, masks, weights, weight_meta,
+        workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, weights, weight_meta,
         *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling));
 }
 
 // Same scheduler and arithmetic as combine_kernel, with fixed-size diagnostics.
 // Legacy V46 tracing stays disabled in both specializations.
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_profile_kernel(
-    GM_ADDR workspace, GM_ADDR forward, GM_ADDR counts, GM_ADDR backward, GM_ADDR backward_counts, GM_ADDR mask,
-    GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta, GM_ADDR profile, uint64_t sample,
+    GM_ADDR workspace, GM_ADDR input, GM_ADDR forward, GM_ADDR counts, GM_ADDR backward, GM_ADDR backward_counts,
+    GM_ADDR mask, GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta, GM_ADDR profile, uint64_t sample,
     GM_ADDR chunk_profile, GM_ADDR peer_profile, ascend_deepep::PutCombineTiling tiling)
 {
     util_set_ffts_config(0U);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Combine<false, true>(workspace, forward, counts, backward, backward_counts, mask, ranges, masks, nullptr, weights,
-                         weight_meta, tiling, profile, sample, chunk_profile, peer_profile);
+    Combine<false, true>(workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, nullptr,
+                         weights, weight_meta, tiling, profile, sample, chunk_profile, peer_profile);
 #endif
 }
 extern "C" ASCEND_DEEPEP_EXPORT void combine_profile_kernel_do(
-    void* stream, uint8_t* workspace, uint8_t* forward, uint8_t* counts, uint8_t* backward, uint8_t* backward_counts,
-    uint8_t* mask, uint8_t* ranges, uint8_t* masks, uint8_t* weights, uint8_t* weight_meta, uint8_t* profile,
-    uint64_t sample, uint8_t* chunk_profile, uint8_t* peer_profile, uint8_t* tiling)
+    void* stream, uint8_t* workspace, uint8_t* input, uint8_t* forward, uint8_t* counts, uint8_t* backward,
+    uint8_t* backward_counts, uint8_t* mask, uint8_t* ranges, uint8_t* masks, uint8_t* weights, uint8_t* weight_meta,
+    uint8_t* profile, uint64_t sample, uint8_t* chunk_profile, uint8_t* peer_profile, uint8_t* tiling)
 {
     combine_profile_kernel<<<64, ascend_deepep::combine_config::kLaunchUbBytes, stream>>>(
-        workspace, forward, counts, backward, backward_counts, mask, ranges, masks, weights, weight_meta, profile,
-        sample, chunk_profile, peer_profile, *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling));
+        workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, weights, weight_meta,
+        profile, sample, chunk_profile, peer_profile, *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling));
 }

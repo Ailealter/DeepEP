@@ -3,7 +3,7 @@
 
 namespace ascend_deepep::notify_diagnostics {
 inline constexpr uint64_t kMagic = 0x4E544659;
-inline constexpr uint32_t kVersion = 1U;
+inline constexpr uint32_t kVersion = 2U;
 inline constexpr uint32_t kWords = 64U;
 inline constexpr uint32_t kHeaderWords = 16U;
 inline constexpr uint32_t kUbBytes = kWords * sizeof(uint64_t);
@@ -55,7 +55,9 @@ enum Phase : uint32_t {
     BackwardGatherExchange = 42U,
     GlobalWaitBackwardGatherExchange = 43U,
     CollectBackward = 44U,
-    End = 45U,
+    FinalizeOutputs = 45U,
+    DispatchPlan = 46U,
+    End = 47U,
 };
 static_assert(kHeaderWords + End + 1U <= kWords);
 static_assert(kUbBytes % 32U == 0U);

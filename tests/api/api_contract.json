@@ -372,7 +372,9 @@
             {"name": "rank", "kind": "KEYWORD_ONLY", "default": null},
             {"name": "world_size", "kind": "KEYWORD_ONLY", "default": null},
             {"name": "bootstrap", "kind": "KEYWORD_ONLY", "default": "default"},
-            {"name": "combine_only", "kind": "KEYWORD_ONLY", "default": false}
+            {"name": "combine_only", "kind": "KEYWORD_ONLY", "default": false},
+            {"name": "use_1g_huge_pages", "kind": "KEYWORD_ONLY", "default": true},
+            {"name": "debug_collectives", "kind": "KEYWORD_ONLY", "default": false}
           ]
         },
         "destroy": {

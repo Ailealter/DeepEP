@@ -89,7 +89,8 @@ void bind_low_latency(py::module_& module)
     });
     module.def("low_latency_comm_args", [](Session& session) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
-        if (session.capacity() != DispatchDedup::kEpServerDedupPeerBytes || session.world() > DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE) {
+        if (session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
+            session.world() > DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE) {
             throw std::invalid_argument("LL requires exactly 8 GiB of symmetric workspace");
         }
         DispatchDedup::CommArgs args{};

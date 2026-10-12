@@ -494,7 +494,7 @@ def main():
     parser.add_argument(
         "--event-only", action="store_true", help="Clean kernel Events only; no instrumented Dispatch passes"
     )
-    parser.add_argument("--rotation-wqes", type=int, choices=(4, 16), default=4)
+    parser.add_argument("--rotation-wqes", type=int, choices=(4,), default=4)
     parser.add_argument("--submit-detail", action="store_true")
     parser.add_argument("--bootstrap-gate", action="store_true")
     parser.add_argument("--weights", action="store_true", help="Enable FP32 route weights and bitwise validation")

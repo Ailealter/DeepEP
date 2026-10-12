@@ -35,11 +35,13 @@ Modified by Joyce_An 2026
 | 使用位置 | 进程组的作用 |
 | --- | --- |
 | Buffer 初始化 | `all_gather` 检查工作区容量、超时、endpoint 和资源状态等配置 |
-| HT dispatch/combine | 在启动前检查各 rank 的调用参数及错误状态；不改变 HT 的接收布局 |
+| HT dispatch/combine | 默认只做本地检查；`debug_collectives=True` 时通过 `all_gather` 检查调用参数及错误状态 |
 | LL dispatch，`do_cpu_sync=None/True` | `all_reduce` 汇总路由计数，返回精确的 `[R,H]` |
 | LL dispatch，`do_cpu_sync=False` | 不通过该组汇总精确接收行数，仍返回容量缓冲区 `[C,H]` |
 
 两种身份配置方式下，token payload 均由 SHMEM 和对应 kernel 传输。Gloo/HCCL 在此承担协调和计数，不替代 dispatch/combine 的数据通信后端。LL 系统测试默认使用 HCCL 进程组，测试控制组与 Buffer 是否接收该组的区别见[测试说明](../tests/README.md#ll-正确性与性能)。
+
+`ElasticBuffer(debug_collectives=True)` 需要传入进程组，且各 rank 设置一致。默认模式保留本地参数校验，某个 rank 报错后由框架终止整个作业；调试模式增加跨 rank 检查及 Host 等待，不用于性能测量。
 
 库不创建或销毁调用方的进程组，不初始化、重置或释放调用方的 NPU 设备。使用和销毁 Buffer 时保持创建时的设备与 ACL context。
 
@@ -48,6 +50,8 @@ Modified by Joyce_An 2026
 `Buffer/ElasticBuffer` 的普通 Runtime 接受 EP2/4/8/16/32/64/128/256/512。对称工作区至少 2 MiB，按 2 MiB 对齐，字节数不能超过 int64 上限；实际分配受设备内存和 SHMEM 地址空间限制。各 rank 的容量相同。**这是资源准入范围；算子的 EP、shape 和容量限制另见 Elastic 文档。**
 
 `ElasticBuffer` 使用 MTE+URMA Session。`num_bytes` 可显式指定；省略时由 HT size hint 计算，不能据此满足 LL 的固定 8 GiB 要求。`Buffer` 使用 MTE 配置，要求显式进程组、`num_scaleup_bytes` 和 `explicitly_destroy=True`，拒绝非零 `num_scaleout_bytes`；资源构造不启用 V1 通信算法。
+
+`ElasticBuffer(use_1g_huge_pages=True)` 默认为 SHMEM 工作区申请 1 GiB 大页；所有 rank 须使用相同设置。设置为 `False` 使用 SHMEM 常规分配。`num_bytes` 仍表示逻辑容量，实际分配包含页对齐和必要的保护区。
 
 ## 生命周期与失败处理
 
@@ -67,7 +71,7 @@ Modified by Joyce_An 2026
 
 `EventOverlap` 保留事件及相关 Tensor；不能用 `EventOverlap(None)` 表示已经完成。`register_hook_after_wait()` 注册的 hook 在添加等待后执行一次，不是设备执行完成回调。上下文管理器退出也会添加等待。指定 `release_handle=True` 后释放包装所持引用，该包装不能再次等待。
 
-HT 的 `async_with_compute_stream=True` 不在返回前为计算流添加输出依赖，调用方通过返回事件连接后续计算。fresh Notify 仍回读计数；Dispatch 保留原生流等待及跨 rank 工作区复用检查；传入进程组时仍执行启动前一致性检查。cached Combine 复用 handle 的计数和布局，通过通信流上的 barrier 保护工作区，不保证所有调用均无 Host 阻塞。LL 只接受默认流选项。`ElasticBuffer.barrier()` 只支持显式 `with_cpu_sync=True, sequential=True` 的同步用法。
+HT 的 `async_with_compute_stream=True` 不在返回前为计算流添加输出依赖，调用方通过返回事件连接后续计算。fresh Notify 仍回读计数；cached Dispatch 支持 `do_cpu_sync=False`，复用 handle 的计数。Dispatch 控制区首次使用或布局变化时仍有原生 Host 同步，开启 `debug_collectives` 也会增加 Host 等待。cached Combine 复用 handle 的计数和布局，通过通信流上的 barrier 保护工作区，不保证所有调用均无 Host 阻塞。LL 只接受默认流选项。`ElasticBuffer.barrier()` 只支持显式 `with_cpu_sync=True, sequential=True` 的同步用法。
 
 ## 上游兼容与平台命名
 
