@@ -79,6 +79,8 @@ class Runtime:
         world_size=None,
         bootstrap="default",
         combine_only=False,
+        use_1g_huge_pages=False,
+        debug_collectives=False,
     ):
         global _OWNER
         native = require_native("Runtime.__init__")
@@ -103,6 +105,14 @@ class Runtime:
         if type(combine_only) is not bool or (combine_only and not udma):
             raise ValueError("combine_only requires a UDMA runtime and a bool value")
         self.combine_only = combine_only
+        if type(use_1g_huge_pages) is not bool or (use_1g_huge_pages and (not udma or self._megamoe)):
+            raise ValueError("use_1g_huge_pages requires an Elastic UDMA runtime and a bool value")
+        self.use_1g_huge_pages = use_1g_huge_pages
+        if type(debug_collectives) is not bool:
+            raise TypeError("debug_collectives must be bool")
+        if debug_collectives and group is None:
+            raise ValueError("debug_collectives=True requires a ProcessGroup")
+        self.debug_collectives = debug_collectives
         dense_qps = os.environ.get("DEEPEP_SHMEM_DENSE_QPS", "0")
         if dense_qps not in ("0", "1"):
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
@@ -160,14 +170,21 @@ class Runtime:
                             self.device,
                         ]
                     )
-                local_values.append(int(udma) + 2 * int(combine_only) + 4 * int(dense_qps))
+                local_values.append(
+                    int(udma)
+                    + 2 * int(combine_only)
+                    + 4 * int(dense_qps)
+                    + 8 * int(use_1g_huge_pages)
+                    + 16 * int(debug_collectives)
+                )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
                 else:
-                    local = torch.tensor(
-                        local_values, dtype=torch.int64, device=f"npu:{self.device}" if backend == "hccl" else "cpu"
-                    )
-                    peers = [torch.empty_like(local) for _ in range(size)]
+                    with torch.inference_mode(False), torch.no_grad():
+                        local = torch.tensor(
+                            local_values, dtype=torch.int64, device=f"npu:{self.device}" if backend == "hccl" else "cpu"
+                        )
+                        peers = [torch.empty_like(local) for _ in range(size)]
                     dist.all_gather(peers, local, group=group)
                     values = [value.cpu().tolist() for value in peers]
                 if any(value[3] for value in values):
@@ -175,7 +192,9 @@ class Runtime:
                 if any(value[:3] != values[0][:3] for value in values):
                     raise ValueError("Ranks disagree on workspace capacity, timeout or bootstrap endpoint")
                 if any(value[-1] != values[0][-1] for value in values):
-                    raise ValueError("Ranks disagree on MTE/URMA runtime engines or QP configuration")
+                    raise ValueError(
+                        "Ranks disagree on MTE/URMA runtime engines, QP configuration, page size or debug_collectives"
+                    )
                 if self._megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
                     if invalid_hosts:
@@ -204,12 +223,14 @@ class Runtime:
             self.notify_inflight = None
             self.stream = npu.Stream(device=self.device)
             self.native = (
-                native.create_combine_runtime(rank, size, capacity, address, timeout, bootstrap == "mpi")
+                native.create_combine_runtime(
+                    rank, size, capacity, address, timeout, bootstrap == "mpi", use_1g_huge_pages
+                )
                 if combine_only
-                else native.create_mpi_runtime(rank, size, capacity, timeout)
+                else native.create_mpi_runtime(rank, size, capacity, timeout, use_1g_huge_pages)
                 if bootstrap == "mpi"
                 else (
-                    native.Runtime(rank, size, capacity, address, timeout, udma)
+                    native.Runtime(rank, size, capacity, address, timeout, udma, use_1g_huge_pages)
                     if udma
                     else factory(rank, size, capacity, address, timeout)
                 )

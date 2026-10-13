@@ -12,8 +12,8 @@ struct Layout {
 inline bool BuildLayout(int64_t p, int64_t b, int64_t h, int64_t k, int64_t e, Layout& out)
 {
     out = {};
-    if (p < 16 || p > DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE || p % 8 || b <= 0 || b > 65536 || h <= 0 || h > kEpServerDedupCombineRecvUbBytes / 12 ||
-        k < 1 || k > 32 || e < p || e > 1024 || e % p || k > e)
+    if (p < 16 || p > DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE || p % 8 || b <= 0 || b > 65536 || h <= 0 ||
+        h > kEpServerDedupCombineRecvUbBytes / 12 || k < 1 || k > 32 || e < p || e > 1024 || e % p || k > e)
         return false;
     const uint64_t capacity = p * b * (k < e / p ? k : e / p);
     const uint32_t peak = capacity < kEpServerDedupCombineMaxTokenNum ? capacity : kEpServerDedupCombineMaxTokenNum;

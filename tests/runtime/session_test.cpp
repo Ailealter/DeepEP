@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0, memsets = 0;
@@ -17,6 +18,14 @@ int expected_world = 2;
 uint64_t expected_bytes = 2 << 20;
 int storage = 0, context_token = 0, another_context = 0;
 void* current_context = &context_token;
+void* source_address = reinterpret_cast<void*>(0x100000000ULL);
+void* symmetric_address = reinterpret_cast<void*>(0x200000000ULL);
+int physical_token = 0;
+uint64_t physical_bytes = 0;
+size_t page_granularity = 1ULL << 30;
+std::string fault;
+std::vector<std::string> physical_calls;
+bool huge_registered = false;
 template <class Action>
 void fails(Action action)
 {
@@ -40,9 +49,97 @@ const char* aclrtGetSocName()
 }
 int aclrtMemset(void* destination, size_t maximum, int value, size_t count)
 {
-    assert(destination == &storage && maximum == expected_bytes && count == expected_bytes && value == 0);
+    assert(destination == (huge_registered ? symmetric_address : &storage));
+    assert(maximum == expected_bytes && count == expected_bytes && value == 0);
     ++memsets;
     return memset_status;
+}
+int aclrtGetDevice(int32_t* device)
+{
+    *device = 3;
+    return 0;
+}
+int aclrtMemGetAllocationGranularity(const aclrtPhysicalMemProp* p, int mode, size_t* result)
+{
+    assert(p->handleType == ACL_MEM_HANDLE_TYPE_NONE && p->allocationType == ACL_MEM_ALLOCATION_TYPE_PINNED);
+    assert(p->memAttr == ACL_HBM_MEM_HUGE1G && p->location.id == 3 && p->location.type == ACL_MEM_LOCATION_TYPE_DEVICE);
+    assert(p->reserve == 0 && mode == ACL_RT_MEM_ALLOC_GRANULARITY_MINIMUM);
+    *result = page_granularity;
+    return fault == "granularity" ? -1 : 0;
+}
+int aclrtMallocPhysical(aclrtDrvMemHandle* handle, size_t bytes, const aclrtPhysicalMemProp* p, uint64_t flags)
+{
+    assert(p->memAttr == ACL_HBM_MEM_HUGE1G && flags == 0);
+    assert(bytes == (((expected_bytes + (1ULL << 30) - 1) >> 30) << 30));
+    physical_calls.push_back("allocate");
+    if (fault == "allocate") return -1;
+    *handle = &physical_token;
+    physical_bytes = bytes;
+    return 0;
+}
+int aclrtReserveMemAddress(void** addr, size_t bytes, size_t alignment, void* requested, uint64_t flags)
+{
+    assert(bytes == physical_bytes && alignment == 0 && requested == nullptr && flags == 0);
+    physical_calls.push_back("reserve");
+    if (fault == "reserve") return -1;
+    *addr = source_address;
+    return 0;
+}
+int aclrtMapMem(void* addr, size_t bytes, size_t offset, aclrtDrvMemHandle handle, uint64_t flags)
+{
+    assert(addr == source_address && bytes == physical_bytes && offset == 0 && handle == &physical_token && flags == 0);
+    physical_calls.push_back("map");
+    return fault == "map" ? -1 : 0;
+}
+int aclrtMemSetAccess(void* addr, size_t bytes, const aclrtMemAccessDesc* access, size_t count)
+{
+    assert(addr == source_address && bytes == physical_bytes && count == 1);
+    assert(access->flags == ACL_RT_MEM_ACCESS_FLAGS_READWRITE && access->location.id == 3);
+    assert(access->location.type == ACL_MEM_LOCATION_TYPE_DEVICE);
+    physical_calls.push_back("access");
+    return fault == "access" ? -1 : 0;
+}
+int aclrtUnmapMem(void* addr)
+{
+    assert(addr == source_address && initialized == 0);
+    physical_calls.push_back("unmap");
+    return fault == "unmap" ? -1 : 0;
+}
+int aclrtReleaseMemAddress(void* addr)
+{
+    assert(addr == source_address && initialized == 0);
+    physical_calls.push_back("release-address");
+    return fault == "release-address" ? -1 : 0;
+}
+int aclrtFreePhysical(aclrtDrvMemHandle handle)
+{
+    assert(handle == &physical_token && initialized == 0);
+    physical_calls.push_back("free-physical");
+    return fault == "free-physical" ? -1 : 0;
+}
+int aclshmemx_init_attr_with_buffers(int mode, aclshmemx_init_attr_t* attr, const aclshmemx_buffer_desc_t* descriptors,
+                                     size_t count)
+{
+    assert(mode == ACLSHMEMX_INIT_WITH_DEFAULT || mode == ACLSHMEMX_INIT_WITH_MPI);
+    assert(attr->n_pes == expected_world && attr->local_mem_size == 0 && count == 1);
+    assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA));
+    assert(descriptors->addr == source_address && descriptors->size == physical_bytes);
+    assert(descriptors->optional_attr->mem_handle == &physical_token);
+    assert(descriptors->optional_attr->fabric_handle == nullptr);
+    for (auto value : descriptors->reserved) assert(value == 0);
+    for (auto value : descriptors->optional_attr->reserved) assert(value == 0);
+    physical_calls.push_back("register");
+    if (init_status == 0) initialized = 2;
+    huge_registered = true;
+    return init_status;
+}
+void* aclshmemx_get_buffer_ptr(const void* addr)
+{
+    assert(addr == source_address && initialized == 2);
+    physical_calls.push_back("translate");
+    return fault == "translate"   ? nullptr
+           : fault == "unaligned" ? static_cast<char*>(symmetric_address) + 16
+                                  : symmetric_address;
 }
 int aclshmemx_init_status()
 {
@@ -70,6 +167,7 @@ int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 }
 int aclshmem_finalize()
 {
+    if (huge_registered) physical_calls.push_back("finalize");
     ++finalized;
     if (finalize_status == 0) {
         initialized = 0;
@@ -104,15 +202,70 @@ int main(int argc, char** argv)
     setenv("DEEPEP_SHMEM_DENSE_QPS", "1", 1);
     const std::string mode = argv[1];
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
-    if (mode == "low-latency" || mode.rfind("ll-rank-bias-", 0) == 0) {
+    if (mode.rfind("huge-", 0) == 0) {
+        fault = mode.substr(5);
+        if (fault == "rounded") expected_bytes = (1ULL << 30) + (2 << 20);
+        if (fault == "exact") expected_bytes = 4ULL << 30;
+        if (fault == "ll-guard") expected_bytes = (8ULL << 30) + (2ULL << 20);
+        if (fault == "overflow") expected_bytes = (1ULL << 63) - (2 << 20);
+        if (fault == "wrong-granularity") page_granularity = 2 << 20;
+        if (fault == "init") init_status = -1;
+        if (fault == "memset") memset_status = -1;
+        if (fault == "finalize") finalize_status = -1;
+        const uint64_t logical_bytes = fault == "ll-guard" ? 8ULL << 30 : expected_bytes;
+        auto create_huge = [&]() {
+            return deepep::Session(0, 2, logical_bytes, "tcp://127.0.0.1:19091", 30, true, false, fault == "mpi", true,
+                                   true);
+        };
+        const std::vector<std::string> setup{"allocate", "reserve", "map", "access", "register", "translate"};
+        if (fault == "normal" || fault == "rounded" || fault == "exact" || fault == "ll-guard" || fault == "mpi" ||
+            fault == "abandoned" || fault == "finalize" || fault == "unmap" || fault == "release-address" ||
+            fault == "free-physical") {
+            auto session = create_huge();
+            assert(session.use_1g_huge_pages() && session.workspace() == symmetric_address);
+            assert(session.workspace_allocation_bytes() == physical_bytes && session.capacity() == logical_bytes);
+            assert(allocations == 0 && frees == 0 && physical_calls == setup && memsets == 1);
+            if (fault == "abandoned") return 0;
+            if (fault == "finalize" || fault == "unmap" || fault == "release-address" || fault == "free-physical") {
+                fails([&]() { session.close(); });
+                const auto calls = physical_calls;
+                fails([&]() { session.close(); });
+                fails([&]() { session.barrier(); });
+                assert(deepep::Session::busy() && !session.closed() && calls == physical_calls);
+                assert(physical_calls.back() == fault && finalized == 1 && frees == 0);
+                return 0;
+            }
+            session.close();
+            session.close();
+            auto expected = setup;
+            expected.insert(expected.end(), {"finalize", "unmap", "release-address", "free-physical"});
+            assert(physical_calls == expected && frees == 0 && finalized == 1 && !deepep::Session::busy());
+        } else {
+            fails(create_huge);
+            assert(frees == 0 && allocations == 0 && deepep::Session::busy() == (fault == "init"));
+            std::vector<std::string> expected;
+            if (fault == "allocate") expected = {"allocate"};
+            if (fault == "reserve") expected = {"allocate", "reserve", "free-physical"};
+            if (fault == "map") expected = {"allocate", "reserve", "map", "release-address", "free-physical"};
+            if (fault == "access")
+                expected = {"allocate", "reserve", "map", "access", "unmap", "release-address", "free-physical"};
+            if (fault == "init") expected = {"allocate", "reserve", "map", "access", "register"};
+            if (fault == "translate" || fault == "unaligned" || fault == "memset") {
+                expected = setup;
+                expected.insert(expected.end(), {"finalize", "unmap", "release-address", "free-physical"});
+            }
+            assert(physical_calls == expected);
+        }
+    } else if (mode == "low-latency" || mode.rfind("ll-rank-bias-", 0) == 0) {
         expected_world = mode == "low-latency" ? 16 : std::stoi(mode.substr(13));
         const uint64_t logical_bytes = 8ULL << 30;
         expected_bytes = logical_bytes + (2ULL << 20);
         // Exercise the highest rank, full guard allocation, original-pointer
         // ownership and logical capacity independently of the EP size.
-        deepep::Session session(expected_world - 1, expected_world, logical_bytes,
-                               "tcp://xxx.xxx.xxx.xxx:xxxxx", 30, true);
+        deepep::Session session(expected_world - 1, expected_world, logical_bytes, "tcp://xxx.xxx.xxx.xxx:xxxxx", 30,
+                                true);
         assert(session.capacity() == logical_bytes && session.workspace() == &storage && memsets == 1);
+        assert(session.workspace_allocation_bytes() == expected_bytes);
         assert(uint64_t(expected_world - 1) * 1024U < expected_bytes - logical_bytes);
         session.close();
         assert(frees == 1 && finalized == 1 && !deepep::Session::busy());

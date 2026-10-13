@@ -400,8 +400,8 @@ private:
         // the existing V_MTE3 publication dependency.
         uint64_t markerMask[2] = {1U, 0U};
         Duplicate<float>(out.template ReinterpretCast<float>()[PacketReceiveLayout::kMarkerOffset / 4U],
-                         mask != 0U ? PacketReceiveLayout::kKeepFlags : PacketReceiveLayout::kCompact,
-                         markerMask, 1U, 1U, 8U);
+                         mask != 0U ? PacketReceiveLayout::kKeepFlags : PacketReceiveLayout::kCompact, markerMask, 1U,
+                         1U, 8U);
         if constexpr (!NeedQuantize) input.template FreeTensor<XType>(x);
         SetFlag<HardEvent::V_MTE3>(lane);
         WaitFlag<HardEvent::V_MTE3>(lane);

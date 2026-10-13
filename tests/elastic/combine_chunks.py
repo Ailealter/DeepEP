@@ -48,8 +48,12 @@ def token_range(chunk, tokens, chunk_tokens=256):
     return begin, min(tokens, begin + chunk_tokens)
 
 
-def decode(records, *, rank, world, tokens, sample, chunk_tokens=256):
+def decode(records, *, rank, world, tokens, sample, chunk_tokens=256, ep8_rank_mte=False):
+    if ep8_rank_mte and world != 8:
+        raise ValueError("EP8 rank MTE diagnostics require EP8")
     expected = shape(world, tokens, chunk_tokens)
+    local = 32 if ep8_rank_mte else min(world, 8)
+    gateway_begin = 32 if ep8_rank_mte else 24 if world > 8 else 8
     groups = world // min(world, 64)
     chunks = expected[1] // (groups + 2)
     if len(records) != 64 or any(len(core) != expected[1] for core in records):
@@ -90,7 +94,7 @@ def decode(records, *, rank, world, tokens, sample, chunk_tokens=256):
                     raise ValueError("Invalid final-reduce window")
                 final_seen.add((core, chunk))
             elif kind == 2:
-                if core < (24 if world > 8 else 8):
+                if core < gateway_begin:
                     raise ValueError("Invalid gateway core")
                 gateway_seen.add((core, group, chunk))
             elif kind == 3:
@@ -113,7 +117,10 @@ def decode(records, *, rank, world, tokens, sample, chunk_tokens=256):
                 cross_seen.add((core, group, chunk))
             elif kind == 4:
                 local_seen.add((core, chunk))
-            if kind in (1, 4) and (core >= min(world, 8) or v["Peer"] != rank // 8 * 8 + core):
+            peer = core // 4 if ep8_rank_mte else rank // 8 * 8 + core
+            if ep8_rank_mte and kind == 1:
+                raise ValueError("EP8 rank MTE has no gather tasks")
+            if kind in (1, 4) and (core >= local or v["Peer"] != peer):
                 raise ValueError("Invalid local peer/core")
             begin, end = token_range(chunk, tokens, chunk_tokens)
             events.append(
@@ -145,29 +152,24 @@ def decode(records, *, rank, world, tokens, sample, chunk_tokens=256):
             )
     if final_seen != {(c, k) for c in range(64) for k in range(chunks)}:
         raise ValueError("Missing final-reduce chunk records")
-    if gateway_seen != {
-        (c, g, k) for c in range(24 if world > 8 else 8, 64) for g in range(groups) for k in range(chunks)
-    }:
+    if gateway_seen != {(c, g, k) for c in range(gateway_begin, 64) for g in range(groups) for k in range(chunks)}:
         raise ValueError("Missing gateway chunk records")
     if cross_seen != (
         {(c, g, k) for c in range(8, 24) for g in range(groups) for k in range(chunks)} if world > 8 else set()
     ):
         raise ValueError("Missing cross-send chunk records")
-    if local_seen != {(c, k) for c in range(min(world, 8)) for k in range(chunks)}:
+    if local_seen != {(c, k) for c in range(local) for k in range(chunks)}:
         raise ValueError("Missing local-return chunk records")
     return events
 
 
 def perfetto_trace(trace, source_name):
     """Chrome JSON trace, with separate AIV/kind/group tracks and one rank clock."""
-    if trace["schema_version"] not in (1, VERSION) or (
-        trace["ticks_per_us"],
-        trace["kernel"],
-        trace["precision_checked"],
-    ) != (
-        TICKS_PER_US,
-        "combine_profile_kernel",
-        True,
+    if (
+        trace["schema_version"] not in (1, VERSION)
+        or (trace["ticks_per_us"], trace["precision_checked"]) != (TICKS_PER_US, True)
+        or trace["kernel"] not in ("combine_profile_kernel", "combine_ep8_mte_profile_kernel")
+        or (trace["kernel"] == "combine_ep8_mte_profile_kernel" and trace["world_size"] != 8)
     ):
         raise ValueError("Unsupported or unvalidated chunk format")
     events, rank = trace["events"], trace["rank"]
@@ -217,7 +219,11 @@ def perfetto_trace(trace, source_name):
         t, counters = e["times_ticks"], e["counters"]
         if any(type(v) is not int or v <= 0 for v in t.values()):
             raise ValueError("Invalid chunk timestamp")
-        if not t["Begin"] <= t["WorkBegin"] <= t["WorkEnd"] <= t["End"]:
+        has_work = "WorkBegin" in t
+        if not has_work and (kind != "cross_send" or any(counters.values()) or any(f in t for f in SEND_FIELDS)):
+            raise ValueError(f"Missing chunk work timestamp: {identity}")
+        work_begin = t.get("WorkBegin", t["WorkEnd"])
+        if not t["Begin"] <= work_begin <= t["WorkEnd"] <= t["End"]:
             raise ValueError(f"Invalid chunk work interval: {identity}")
         if any(v > t["End"] for v in t.values()):
             raise ValueError(f"Timestamp exceeds chunk end: {identity}")
@@ -262,7 +268,7 @@ def perfetto_trace(trace, source_name):
             ),
         )
         if "WaitBegin" in t:
-            if not t["WaitBegin"] <= t["Ready"] <= t["WorkBegin"]:
+            if not t["WaitBegin"] <= t["Ready"] <= work_begin:
                 raise ValueError(f"Invalid chunk readiness interval: {identity}")
             wait_name = (
                 f"SO_window_wait | chunks {chunk:02d}..{e['window_end']:02d}"
@@ -272,12 +278,13 @@ def perfetto_trace(trace, source_name):
             emit(wait_name, t["WaitBegin"], t["Ready"], dict(start_field="WaitBegin", end_field="Ready"))
         reduction = kind in ("gateway_reduce", "final_reduce") and counters["Tokens"] > 0
         work_name = kind if not kind.endswith("reduce") or reduction else "no_reduce"
-        emit(
-            f"{work_name} | chunk {chunk:02d}",
-            t["WorkBegin"],
-            t["WorkEnd"],
-            dict(counters=counters, start_field="WorkBegin", end_field="WorkEnd", semantics=semantics[kind]),
-        )
+        if has_work:
+            emit(
+                f"{work_name} | chunk {chunk:02d}",
+                t["WorkBegin"],
+                t["WorkEnd"],
+                dict(counters=counters, start_field="WorkBegin", end_field="WorkEnd", semantics=semantics[kind]),
+            )
         if reduction:
             emit(
                 f"{kind}_done | chunk {chunk:02d}",

@@ -4,9 +4,8 @@
 
 #include "peer_address.hpp"
 
-// Queue owners have already completed their URMA SO/quiet protocol. Drain this
-// AIV's remaining MTE stores, but do not join other AIVs/ranks here. The host
-// wrapper queues a separate all-rank barrier before exposing the output.
+// Queue owners publish terminal notifications after their URMA SO/quiet.
+// Local MTE stores are drained before AIV7's incoming flag wait.
 template <bool Profile>
 __aicore__ inline void DrainDispatchStores(const DispatchTiling& t, uint64_t* detail)
 {
@@ -25,6 +24,5 @@ __aicore__ inline void PeerScales(GM_ADDR workspace, GM_ADDR input, GM_ADDR dest
                                   TBuf<TPosition::VECOUT>& wqe_scratch)
 {
     PeerScalePlan plan{destinations, input, reinterpret_cast<GM_ADDR>(t.output_scales_address), t.address_stride};
-    DeepepSecondaryState unused{};
-    DispatchScalePipeline::Run<Profile>(workspace, t, plan, staging, metadata, wqe_scratch, unused);
+    DispatchScalePipeline::Run<Profile>(workspace, t, plan, staging, metadata, wqe_scratch);
 }

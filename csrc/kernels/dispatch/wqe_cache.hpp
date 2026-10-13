@@ -40,8 +40,6 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
         asc_vf_call<DispatchBuildPeerTableWqesVf>(dim3(32U), reinterpret_cast<__ubuf__ uint64_t*>(output.GetPhyAddr()),
                                                   header, reinterpret_cast<__ubuf__ uint32_t*>(rows.GetPhyAddr()),
                                                   emit_count, s.row_bytes, source, target);
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         SetFlag<HardEvent::V_S>(EVENT_ID0);
         WaitFlag<HardEvent::V_S>(EVENT_ID0);
         DetailAdd<Profile>(s.detail, 8U, DetailClock<Profile>(s.detail_mode) - build_start);
@@ -84,8 +82,6 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
         asc_vf_call<DispatchBuildPeerTableWqesVf>(dim3(32U), reinterpret_cast<__ubuf__ uint64_t*>(output.GetPhyAddr()),
                                                   header, reinterpret_cast<__ubuf__ uint32_t*>(rows.GetPhyAddr()),
                                                   count, s.row_bytes, source, target);
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
         SetFlag<HardEvent::V_S>(EVENT_ID0);
         WaitFlag<HardEvent::V_S>(EVENT_ID0);
         DetailAdd<Profile>(s.detail, 8U, DetailClock<Profile>(s.detail_mode) - build_start);

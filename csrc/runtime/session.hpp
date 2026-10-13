@@ -19,7 +19,7 @@ namespace deepep {
 class Session {
 public:
     Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false,
-            bool megamoe = false, bool mpi = false, bool combine_only = false);
+            bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false);
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
@@ -32,6 +32,14 @@ public:
     uint64_t capacity() const
     {
         return bytes_;
+    }
+    bool use_1g_huge_pages() const
+    {
+        return use_1g_huge_pages_;
+    }
+    uint64_t workspace_allocation_bytes() const
+    {
+        return use_1g_huge_pages_ ? huge_page_bytes_ : allocation_bytes_;
     }
     static bool busy();
     // 仅借给可选 MegaMoE 扩展；内存仍由本 Session 独占并显式销毁。
@@ -99,9 +107,17 @@ private:
     Session() = default;
 #endif
     void check_context() const;
+    void allocate_huge_workspace(uint64_t bytes);
+    void release_huge_workspace();
     aclrtContext context_ = nullptr;
     void* workspace_ = nullptr;
+    void* huge_page_source_ = nullptr;
+    aclrtDrvMemHandle huge_page_handle_ = nullptr;
+    uint64_t huge_page_bytes_ = 0;
+    bool huge_page_mapped_ = false;
+    bool use_1g_huge_pages_ = false;
     uint64_t bytes_ = 0;
+    uint64_t allocation_bytes_ = 0;
     bool closed_ = true;
     bool poisoned_ = false;
     int rank_ = 0;

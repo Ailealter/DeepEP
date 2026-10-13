@@ -13,8 +13,9 @@
 using namespace AscendC;
 namespace {
 #if !defined(CATLASS_ARCH) || CATLASS_ARCH == 3510
+#include "../dispatch/peer_plan.hpp"
 constexpr uint32_t kSimtThreads = 128U;
-constexpr uint32_t kSimtCores = 32U;
+constexpr uint32_t kSimtCores = ascend_deepep::kNotifyCores;
 constexpr uint32_t kTileTokens = ascend_deepep::kNotifyLocalTopkTileTokens;
 constexpr uint32_t kMetaFields = ascend_deepep::kNotifyLocalTopkRouteMetaFields;
 // Wire fields pack rank <= 511 and top-k positions <= 15.
@@ -25,10 +26,13 @@ constexpr uint32_t kWireTopkMask = 0xfU;
 constexpr uint32_t kWirePrimaryTopkShift = 9U;
 constexpr uint32_t kWireSecondaryTopkShift = 13U;
 
-template <uint32_t CoreCount = kSimtCores>
-__simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(
-    __gm__ ascend_deepep::topk_idx_t* topk_idx, __gm__ int64_t* server_mask, __gm__ int32_t* route_meta, uint32_t world,
-    uint32_t tokens, uint32_t topk, uint32_t experts, uint32_t chunk_tokens, uint32_t core, __ubuf__ int32_t* routes_ub)
+template <uint32_t CoreCount = kSimtCores, bool RankDedup = false>
+__simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(__gm__ ascend_deepep::topk_idx_t* topk_idx,
+                                                                      __gm__ int64_t* server_mask,
+                                                                      __gm__ int32_t* route_meta, uint32_t rank,
+                                                                      uint32_t world, uint32_t tokens, uint32_t topk,
+                                                                      uint32_t experts, uint32_t chunk_tokens,
+                                                                      uint32_t core, __ubuf__ int32_t* routes_ub)
 {
     const uint32_t local_experts = experts / world;
     const uint32_t tiles = (uint64_t(tokens) + kTileTokens - 1U) / kTileTokens;
@@ -40,23 +44,45 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(
             continue;
         }
         int32_t expert_ids[16];
+        int32_t rank_primary[16];
+        int32_t rank_slot[16];
         int32_t first_slot[64];
         for (uint32_t server = 0; server < 64U; ++server) {
             first_slot[server] = -1;
         }
         const uint64_t base = uint64_t(token) * topk;
         uint64_t mask = 0;
+        int32_t local_primary = -1;
         for (uint32_t k = 0; k < topk; ++k) {
             const int64_t value = asc_ldcg(topk_idx + base + k);
             const int32_t expert = value >= 0 && uint64_t(value) < experts ? int32_t(value) : -1;
             expert_ids[k] = expert;
             if (expert >= 0) {
-                const uint32_t server = uint32_t(expert) / local_experts / 8U;
-                mask |= uint64_t(1) << server;
-                if (first_slot[server] < 0) {
-                    first_slot[server] = int32_t(k);
+                if constexpr (RankDedup) {
+                    int32_t primary = int32_t(k), slot = 0;
+                    for (uint32_t previous = 0; previous < k; ++previous) {
+                        if (expert_ids[previous] < 0) continue;
+                        if (expert_ids[previous] / int32_t(local_experts) == expert / int32_t(local_experts)) {
+                            primary = rank_primary[previous];
+                            slot = rank_slot[previous];
+                            break;
+                        }
+                        slot += rank_primary[previous] == int32_t(previous);
+                    }
+                    rank_primary[k] = primary;
+                    rank_slot[k] = slot;
+                    mask |= uint64_t(1) << uint32_t(slot);
+                } else {
+                    const uint32_t peer = uint32_t(expert) / local_experts;
+                    const uint32_t server = peer / 8U;
+                    mask |= uint64_t(1) << server;
+                    if (first_slot[server] < 0) first_slot[server] = int32_t(k);
+                    if (peer == rank && local_primary < 0) local_primary = int32_t(k);
                 }
             }
+        }
+        if constexpr (!RankDedup) {
+            if (local_primary >= 0) first_slot[rank / 8U] = local_primary;
         }
         asc_stcg(server_mask + token, int64_t(mask));
         for (uint32_t k = 0; k < topk; ++k) {
@@ -65,7 +91,7 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(
             int32_t gateway = -1;
             int32_t flags = 0;
             if (expert >= 0) {
-                primary = first_slot[uint32_t(expert) / local_experts / 8U];
+                primary = RankDedup ? rank_primary[k] : first_slot[uint32_t(expert) / local_experts / 8U];
                 gateway = expert_ids[primary] / int32_t(local_experts);
                 flags = int32_t(k) == primary ? 7 : 9;
             }
@@ -76,7 +102,7 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(
             asc_stcg(row, expert);
             asc_stcg(row + 1U, gateway);
             asc_stcg(row + 2U, primary);
-            asc_stcg(row + 3U, int32_t(token / chunk_tokens));
+            asc_stcg(row + 3U, RankDedup ? (expert >= 0 ? rank_slot[k] : -1) : int32_t(token / chunk_tokens));
             // 索引 4 的 ordinal 留给下一步：不能用并行原子分配改变接收顺序。
             asc_stcg(row + 5U, flags);
         }
@@ -115,12 +141,13 @@ __simt_vf__ __launch_bounds__(128) inline void CountLocalTopkTilesVf(__gm__ int3
     asc_threadfence();
 }
 
-template <bool CachedHist = false, uint32_t CoreCount = kSimtCores>
+template <bool CachedHist = false, uint32_t CoreCount = kSimtCores, bool RankDedup = false>
 __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkVf(__gm__ ascend_deepep::topk_idx_t* topk_idx,
                                                                 __gm__ int64_t* server_mask, __gm__ int32_t* route_meta,
-                                                                __gm__ int32_t* hist, uint32_t world, uint32_t tokens,
-                                                                uint32_t topk, uint32_t experts, uint32_t chunk_tokens,
-                                                                uint32_t core, __ubuf__ int32_t* hist_ub = nullptr)
+                                                                __gm__ int32_t* hist, uint32_t rank, uint32_t world,
+                                                                uint32_t tokens, uint32_t topk, uint32_t experts,
+                                                                uint32_t chunk_tokens, uint32_t core,
+                                                                __ubuf__ int32_t* hist_ub = nullptr)
 {
     const uint32_t local_experts = experts / world;
     const uint32_t columns = experts + world;
@@ -144,13 +171,16 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkVf(__gm__ ascend_de
         const uint32_t end = tokens - begin < kTileTokens ? tokens : begin + kTileTokens;
         for (uint32_t token = begin; token < end; ++token) {
             int32_t expert_ids[16];
+            int32_t rank_primary[16];
+            int32_t rank_slot[16];
             int32_t first_slot_per_server[64];
             for (uint32_t server = 0; server < 64U; ++server) {
                 first_slot_per_server[server] = -1;
             }
             const uint64_t base = uint64_t(token) * topk;
             uint64_t mask = 0;
-            // 按原始 top-k 顺序选 gateway：每个 server 第一次出现的专家所在 rank。
+            int32_t local_primary = -1;
+            // Prefer the source rank when selected; otherwise use the server's first hit.
             // 非法专家跳过；server_mask 的第 s 位表示该 token 是否需要发往 server s。
             for (uint32_t k = 0; k < topk; ++k) {
                 const int64_t value = asc_ldcg(topk_idx + base + k);
@@ -159,11 +189,30 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkVf(__gm__ ascend_de
                 if (expert < 0) {
                     continue;
                 }
-                const uint32_t server = uint32_t(expert) / local_experts / 8U;
-                mask |= uint64_t(1) << server;
-                if (first_slot_per_server[server] < 0) {
-                    first_slot_per_server[server] = int32_t(k);
+                if constexpr (RankDedup) {
+                    int32_t primary = int32_t(k), slot = 0;
+                    for (uint32_t previous = 0; previous < k; ++previous) {
+                        if (expert_ids[previous] < 0) continue;
+                        if (expert_ids[previous] / int32_t(local_experts) == expert / int32_t(local_experts)) {
+                            primary = rank_primary[previous];
+                            slot = rank_slot[previous];
+                            break;
+                        }
+                        slot += rank_primary[previous] == int32_t(previous);
+                    }
+                    rank_primary[k] = primary;
+                    rank_slot[k] = slot;
+                    mask |= uint64_t(1) << uint32_t(slot);
+                } else {
+                    const uint32_t peer = uint32_t(expert) / local_experts;
+                    const uint32_t server = peer / 8U;
+                    mask |= uint64_t(1) << server;
+                    if (first_slot_per_server[server] < 0) first_slot_per_server[server] = int32_t(k);
+                    if (peer == rank && local_primary < 0) local_primary = int32_t(k);
                 }
+            }
+            if constexpr (!RankDedup) {
+                if (local_primary >= 0) first_slot_per_server[rank / 8U] = local_primary;
             }
             asc_stcg(server_mask + token, int64_t(mask));
             // 每条有效路由都有专家内序号，重复专家的不同 top-k 槽也分别计数。
@@ -176,7 +225,8 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkVf(__gm__ ascend_de
                 int32_t ordinal = -1;
                 int32_t flags = 0;
                 if (expert >= 0) {
-                    primary = first_slot_per_server[uint32_t(expert) / local_experts / 8U];
+                    primary =
+                        RankDedup ? rank_primary[k] : first_slot_per_server[uint32_t(expert) / local_experts / 8U];
                     gateway = expert_ids[primary] / int32_t(local_experts);
                     if constexpr (CachedHist) {
                         ordinal = local_counts[expert];
@@ -201,7 +251,7 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkVf(__gm__ ascend_de
                 asc_stcg(row, expert);
                 asc_stcg(row + 1, gateway);
                 asc_stcg(row + 2, primary);
-                asc_stcg(row + 3, int32_t(token / chunk_tokens));
+                asc_stcg(row + 3, RankDedup ? (expert >= 0 ? rank_slot[k] : -1) : int32_t(token / chunk_tokens));
                 asc_stcg(row + 4, ordinal);
                 asc_stcg(row + 5, flags);
             }
@@ -352,7 +402,7 @@ using NotifyTiling = ascend_deepep::NotifyTiling;
 // R1/R2 接收区由 source rank 独占一行；R3 由本 server gateway lane 独占一行。
 // F 发包按 token tile 划分，接收端逐行写回；B 行按 lane/source/chunk 划分。
 // 前缀和确定独占写区间，各级本地偏移 scratch 不与通信接收区重叠。
-// UB：8 KiB 通信暂存+32 KiB meta 缓存+8 KiB bases 缓存。
+// 各阶段复用 tiling 中声明的通信、meta 和 bases UB。
 // forward 阶段 meta/bases 由 MTE2 写；计划和 uint16 token 前缀矩阵位于 meta 后方。
 // count、核内 token prefix、row writer 之间显式 V 同步；跨 tile 的 prefix 使用原有全核同步。
 // parse 在更早阶段暂借 meta UB 更新 histogram，经 V_MTE3 搬出，排空后才供 MTE2 复用。
@@ -455,7 +505,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyResolveDstVf(__gm__ int32_t
 constexpr uint32_t kForwardTile = 32U;
 
 template <bool Write, bool Cached = false, bool SavePlan = false, uint32_t CoreCount = kSimtCores,
-          bool CachedCounts = false>
+          bool CachedCounts = false, bool RankDedup = false>
 __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
     __gm__ int32_t* meta, __gm__ int32_t* bases, __gm__ int32_t* offsets, __gm__ int32_t* packets, uint32_t rank,
     uint32_t world, uint32_t experts, uint32_t tokens, uint32_t topk, uint64_t packet_words, uint32_t core,
@@ -534,11 +584,13 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
                     int32_t expert;
                     int32_t primary_row;
                     int32_t peer_row = -1;
+                    int32_t return_slot = -1;
                     if constexpr (Cached) {
                         auto* row = meta_ub + ub_token + k * 6U;
                         auto* first = meta_ub + ub_token + primary * 6U;
                         expert = row[0];
                         primary_row = bases_ub[first[0]] + first[4];
+                        if constexpr (RankDedup) return_slot = first[3];
                         if (!direct) {
                             peer_row = bases_ub[expert] + row[4];
                         }
@@ -547,6 +599,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
                         auto* first = meta + (uint64_t(token) * topk + primary) * 6U;
                         expert = asc_ldcg(row);
                         primary_row = asc_ldcg(bases + asc_ldcg(first)) + asc_ldcg(first + 4U);
+                        if constexpr (RankDedup) return_slot = asc_ldcg(first + 3U);
                         if (!direct) {
                             peer_row = asc_ldcg(bases + expert) + asc_ldcg(row + 4U);
                         }
@@ -557,7 +610,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
                     asc_stcg(out + 2U, primary_row);
                     asc_stcg(out + 3U, direct ? -1 : expert / int32_t(experts / world));
                     asc_stcg(out + 4U, peer_row);
-                    asc_stcg(out + 5U, int32_t(-1));
+                    asc_stcg(out + 5U, return_slot);
                 }
             }
         }
@@ -657,7 +710,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTokenPrefixVf(__gm__
     asc_threadfence();
 }
 
-template <bool TokenPrefix = false, uint32_t CoreCount = kSimtCores>
+template <bool TokenPrefix = false, uint32_t CoreCount = kSimtCores, bool RankDedup = false>
 __simt_vf__ __launch_bounds__(128) inline void NotifyForwardRowsVf(
     __gm__ int32_t* offsets, __gm__ int32_t* packets, uint32_t rank, uint32_t world, uint32_t experts, uint32_t tokens,
     uint32_t topk, uint64_t packet_words, uint32_t core, __ubuf__ int32_t* meta_ub, __ubuf__ int32_t* bases_ub,
@@ -678,11 +731,12 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardRowsVf(
         if (local_row < 0) {
             continue;
         }
-        const bool direct = plan_ub[route * 2U + 1U] != 0;
+        const bool direct = (plan_ub[route * 2U + 1U] & 1) != 0;
         auto* row = meta_ub + route * 6U;
         const uint32_t gateway = uint32_t(row[1]);
         auto* first = meta_ub + (route - route % topk + uint32_t(row[2])) * 6U;
         const int32_t primary_row = bases_ub[first[0]] + first[4];
+        const int32_t return_slot = RankDedup ? first[3] : -1;
         const int32_t expert = row[0];
         const int32_t peer_row = direct ? -1 : bases_ub[expert] + row[4];
         uint32_t index = uint32_t(asc_ldcg(offsets + uint64_t(gateway) * tiles + tile)) + uint32_t(local_row);
@@ -697,7 +751,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardRowsVf(
         asc_stcg(out + 2U, primary_row);
         asc_stcg(out + 3U, direct ? -1 : expert / int32_t(experts / world));
         asc_stcg(out + 4U, peer_row);
-        asc_stcg(out + 5U, int32_t(-1));
+        asc_stcg(out + 5U, return_slot);
     }
     asc_threadfence();
 }
@@ -811,7 +865,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyGatherPrefixVf(__gm__ int32
     asc_threadfence();
 }
 
-template <uint32_t CoreCount = kSimtCores>
+template <uint32_t CoreCount = kSimtCores, bool RankDedup = false>
 __simt_vf__ __launch_bounds__(128) inline void NotifyBuildForwardRowsVf(
     __gm__ int32_t* packets, __gm__ int32_t* offsets, __gm__ int32_t* prefix, __gm__ int32_t* forward,
     __gm__ int32_t* counts, __gm__ int32_t* weight_return_meta, uint32_t rank, uint32_t world, uint32_t capacity,
@@ -827,18 +881,23 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyBuildForwardRowsVf(
     if (source_worker == 0U) {
         asc_stcg(counts + source, int32_t(count));
     }
-    const int32_t source_base = asc_ldcg(prefix + source);
+    const int32_t source_base = RankDedup ? 0 : asc_ldcg(prefix + source);
     // 一个线程每次写一行。EP32 每个 source 有 128 个线程，不再让一个线程串行写 32 行。
     for (uint32_t i = source_worker; i < count; i += source_workers) {
         auto* row = packet + 16U + uint64_t(i) * 6U;
         auto* out = forward + (uint64_t(source) * capacity + i) * 6U;
-        const int32_t local_gather = asc_ldcg(out + 5U);
+        const int32_t local_gather = RankDedup ? -1 : asc_ldcg(out + 5U);
         const uint32_t wire_source = uint32_t(asc_ldcg(row));
         const int32_t source_rank = int32_t(wire_source & kWireRankMask);
         const int32_t token = asc_ldcg(row + 1U);
         // Column 0 is filled with token_end by NotifyChunkRangesVf.
         for (uint32_t field = 1; field < 5U; ++field) {
             asc_stcg(out + field, asc_ldcg(row + field));
+        }
+        if constexpr (RankDedup) {
+            const uint32_t servers = (world + 7U) / 8U;
+            const uint32_t slots = servers > topk ? servers : topk;
+            asc_stcg(out + 1U, -int32_t(uint32_t(token) * slots + uint32_t(asc_ldcg(row + 5U))) - 1);
         }
         const uint64_t task = uint64_t(source) * tiles + i / kForwardTile;
         asc_stcg(out + 5U, local_gather >= 0 ? source_base + asc_ldcg(offsets + task) + local_gather : -1);
@@ -863,21 +922,29 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyBuildForwardRowsVf(
 template <uint32_t CoreCount = kSimtCores>
 __simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(
     __gm__ int32_t* packets, __gm__ int32_t* forward, uint32_t capacity, __gm__ int32_t* ranges, __gm__ int32_t* masks,
-    __gm__ int32_t* backward_counts, uint32_t rank, uint32_t world, uint32_t chunks, uint32_t chunk_tokens,
-    uint32_t tokens, uint64_t packet_words, uint32_t core)
+    __gm__ int32_t* backward_counts, __gm__ int32_t* backward_ordinals, uint32_t rank, uint32_t world, uint32_t chunks,
+    uint32_t chunk_tokens, uint32_t tokens, uint64_t packet_words, uint32_t core)
 {
     const uint32_t lanes = world < 8U ? world : 8U;
     const uint64_t lane_stride = uint64_t(world) * chunks;
-    for (uint64_t task = threadIdx.x * CoreCount + core; task < uint64_t(world) * chunks;
-         task += (CoreCount * kNotifySimtThreads)) {
+    const uint32_t segments = ascend_deepep::NotifyChunkSegments(capacity, chunks, chunk_tokens);
+    const uint32_t workers = kNotifySimtThreads / segments;
+    const uint32_t segment = threadIdx.x % segments;
+    const uint32_t worker = threadIdx.x / segments;
+    for (uint64_t task = uint64_t(worker) * CoreCount + core; worker < workers && task < uint64_t(world) * chunks;
+         task += CoreCount * workers) {
         const uint32_t source = task / chunks;
         const uint32_t chunk = task % chunks;
         const uint32_t first = tokens < chunk_tokens ? tokens : chunk_tokens;
         const uint32_t splits = first < 4U ? first : 4U;
-        const uint32_t token_begin_bound =
+        const uint32_t chunk_begin =
             chunk < splits ? (chunk * first + splits - 1U) / splits : (chunk + 1U - splits) * chunk_tokens;
-        const uint32_t token_end_bound =
+        const uint32_t chunk_end =
             chunk < splits ? ((chunk + 1U) * first + splits - 1U) / splits : (chunk + 2U - splits) * chunk_tokens;
+        const uint32_t segment_begin = chunk_begin + segment * ascend_deepep::kNotifyChunkSegmentTokens;
+        const uint32_t token_begin_bound = segment_begin < chunk_end ? segment_begin : chunk_end;
+        const uint32_t segment_end = token_begin_bound + ascend_deepep::kNotifyChunkSegmentTokens;
+        const uint32_t token_end_bound = segments == 1U || segment_end > chunk_end ? chunk_end : segment_end;
         auto* packet = packets + uint64_t(source) * packet_words;
         const uint32_t count = uint32_t(asc_ldcg(packet));
         uint32_t begin = 0;
@@ -917,9 +984,15 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(
                 // This is also NotifyGatherCountTilesVf's gather-row predicate.
                 // Read the immutable packet, not forward columns still being
                 // written by another core in NotifyBuildForwardRowsVf.
+                uint32_t ordinal = 0U;
 #pragma unroll
                 for (uint32_t lane = 0; lane < 8U; ++lane) {
-                    counts[lane] += uint32_t(peer) == rank / 8U * 8U + lane;
+                    const bool matches = uint32_t(peer) == rank / 8U * 8U + lane;
+                    ordinal += matches ? counts[lane] : 0U;
+                    counts[lane] += matches;
+                }
+                if (uint32_t(peer) / 8U == rank / 8U) {
+                    asc_stcg(backward_ordinals + uint64_t(source) * packet_words + 16U + end, int32_t(ordinal));
                 }
             }
             ++end;
@@ -929,13 +1002,66 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(
         for (uint32_t i = token_begin; i < end; ++i) {
             asc_stcg(forward + (uint64_t(source) * capacity + i) * 6U, int32_t(end));
         }
-        asc_stcg(ranges + task * 2U, int32_t(begin));
-        asc_stcg(ranges + task * 2U + 1U, int32_t(end));
+        auto* partial = backward_ordinals;
+        if (segments > 1U) {
+            partial += uint64_t(source) * packet_words + 16U + capacity +
+                       (uint64_t(chunk) * segments + segment) * ascend_deepep::kNotifyChunkSegmentWords;
+            asc_stcg(partial, int32_t(begin));
+            asc_stcg(partial + 1U, int32_t(end));
+            asc_stcg(partial + 2U, mask);
+        } else {
+            asc_stcg(ranges + task * 2U, int32_t(begin));
+            asc_stcg(ranges + task * 2U + 1U, int32_t(end));
+            asc_stcg(masks + task, mask);
+        }
+#pragma unroll
+        for (uint32_t lane = 0; lane < 8U; ++lane) {
+            if (segments > 1U) {
+                asc_stcg(partial + 3U + lane, int32_t(counts[lane]));
+            } else if (lane < lanes) {
+                // One (source, chunk) owner writes every lane, including zeros.
+                asc_stcg(backward_counts + uint64_t(lane) * lane_stride + task, int32_t(counts[lane]));
+            }
+        }
+    }
+    asc_threadfence();
+}
+
+template <uint32_t CoreCount = kSimtCores>
+__simt_vf__ __launch_bounds__(128) inline void NotifyPrefixChunkSegmentsVf(
+    __gm__ int32_t* scratch, __gm__ int32_t* ranges, __gm__ int32_t* masks, __gm__ int32_t* backward_counts,
+    uint32_t capacity, uint32_t world, uint32_t chunks, uint32_t chunk_tokens, uint64_t packet_words, uint32_t core)
+{
+    const uint32_t segments = ascend_deepep::NotifyChunkSegments(capacity, chunks, chunk_tokens);
+    if (segments == 1U) {
+        return;
+    }
+    const uint32_t lanes = world < 8U ? world : 8U;
+    const uint64_t lane_stride = uint64_t(world) * chunks;
+    for (uint64_t task = uint64_t(threadIdx.x) * CoreCount + core; task < uint64_t(world) * chunks;
+         task += CoreCount * kNotifySimtThreads) {
+        const uint32_t source = task / chunks, chunk = task % chunks;
+        auto* first = scratch + uint64_t(source) * packet_words + 16U + capacity +
+                      uint64_t(chunk) * segments * ascend_deepep::kNotifyChunkSegmentWords;
+        uint32_t counts[8]{};
+        int32_t mask = 0;
+        for (uint32_t segment = 0; segment < segments; ++segment) {
+            auto* partial = first + segment * ascend_deepep::kNotifyChunkSegmentWords;
+            mask |= asc_ldcg(partial + 2U);
+#pragma unroll
+            for (uint32_t lane = 0; lane < 8U; ++lane) {
+                const uint32_t count = uint32_t(asc_ldcg(partial + 3U + lane));
+                asc_stcg(partial + 3U + lane, int32_t(counts[lane]));
+                counts[lane] += count;
+            }
+        }
+        asc_stcg(ranges + task * 2U, asc_ldcg(first));
+        asc_stcg(ranges + task * 2U + 1U,
+                 asc_ldcg(first + (segments - 1U) * ascend_deepep::kNotifyChunkSegmentWords + 1U));
         asc_stcg(masks + task, mask);
 #pragma unroll
         for (uint32_t lane = 0; lane < 8U; ++lane) {
             if (lane < lanes) {
-                // One (source, chunk) owner writes every lane, including zeros.
                 asc_stcg(backward_counts + uint64_t(lane) * lane_stride + task, int32_t(counts[lane]));
             }
         }
@@ -1001,50 +1127,55 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyPrefixBackwardTasksVf(__gm_
 
 template <uint32_t CoreCount = kSimtCores>
 __simt_vf__ __launch_bounds__(128) inline void NotifyWriteBackwardTasksVf(
-    __gm__ int32_t* forward, __gm__ int32_t* ranges, __gm__ int32_t* offsets, __gm__ int32_t* group_offsets,
+    __gm__ int32_t* forward, __gm__ int32_t* ordinals, __gm__ int32_t* offsets, __gm__ int32_t* group_offsets,
     __gm__ int64_t* packets, __gm__ int32_t* forward_packets, uint32_t rank, uint32_t world, uint32_t chunks,
-    uint32_t topk, uint32_t packet_capacity, uint64_t packet_words, uint64_t forward_packet_words, uint32_t core)
+    uint32_t chunk_tokens, uint32_t tokens, uint32_t topk, uint32_t packet_capacity, uint64_t packet_words,
+    uint64_t forward_packet_words, uint32_t core)
 {
-    // 各任务独占 prefix 分配的区间。chunk 尾标记也由同一个任务写入。
-    const uint32_t lanes = world < 8U ? world : 8U;
     const uint32_t worker = threadIdx.x * CoreCount + core;
-    const uint64_t task_count = uint64_t(lanes) * world * chunks;
-    for (uint64_t task = worker; task < task_count; task += (CoreCount * kNotifySimtThreads)) {
-        const uint32_t lane = task / (uint64_t(world) * chunks);
-        const uint64_t remainder = task % (uint64_t(world) * chunks);
-        const uint32_t source = remainder / chunks;
-        const uint32_t chunk = remainder % chunks;
-        const uint64_t range_index = uint64_t(source) * chunks + chunk;
-        const uint32_t begin = uint32_t(asc_ldcg(ranges + range_index * 2U));
-        const uint32_t end = uint32_t(asc_ldcg(ranges + range_index * 2U + 1U));
-        const uint32_t peer = rank / 8U * 8U + lane;
-        const uint32_t groups = world / (world < 64U ? world : 64U);
-        const uint32_t group = first_hit_schedule::CombineGroup(rank, world, source);
+    const uint32_t source = worker % world;
+    const uint32_t source_worker = worker / world;
+    const uint32_t source_workers = (CoreCount * kNotifySimtThreads) / world;
+    const uint32_t groups = world / (world < 64U ? world : 64U);
+    const uint32_t group = first_hit_schedule::CombineGroup(rank, world, source);
+    const uint32_t first = tokens < chunk_tokens ? tokens : chunk_tokens;
+    const uint32_t splits = first < 4U ? first : 4U;
+    const uint32_t segments = ascend_deepep::NotifyChunkSegments(packet_capacity, chunks, chunk_tokens);
+    auto* received = forward_packets + uint64_t(source) * forward_packet_words;
+    const uint32_t count = uint32_t(asc_ldcg(received));
+    for (uint32_t i = source_worker; i < count; i += source_workers) {
+        auto* row = forward + (uint64_t(source) * packet_capacity + i) * 6U;
+        const int32_t peer = asc_ldcg(row + 3U);
+        const int32_t gather = asc_ldcg(row + 5U);
+        if (peer < 0 || peer == int32_t(rank) || uint32_t(peer) / 8U != rank / 8U || gather < 0) {
+            continue;
+        }
+        const uint32_t lane = uint32_t(peer) % 8U;
+        const uint32_t token = uint32_t(asc_ldcg(row + 1U));
+        const uint32_t chunk = token < first ? token * splits / first : token / chunk_tokens + splits - 1U;
+        const uint64_t task = (uint64_t(lane) * world + source) * chunks + chunk;
         auto* bounds = group_offsets + ((uint64_t(lane) * chunks + chunk) * groups + group) * 2U;
-        uint32_t output = uint32_t(asc_ldcg(offsets + task)) + uint32_t(asc_ldcg(bounds));
-        __gm__ int64_t* last = nullptr;
-        auto* packet = packets + uint64_t(lane) * packet_words;
-        for (uint32_t i = begin; i < end; ++i) {
-            auto* row = forward + (uint64_t(source) * packet_capacity + i) * 6U;
-            if (asc_ldcg(row + 3U) != int32_t(peer) || asc_ldcg(row + 5U) < 0) {
-                continue;
-            }
-            auto* out = packet + 8U + uint64_t(output++) * 3U;
-            // forward_recv remains intact until this exchange has finished.
-            // Its record order matches the restored, persisted forward list.
-            const uint32_t wire_source =
-                uint32_t(asc_ldcg(forward_packets + uint64_t(source) * forward_packet_words + 16U + uint64_t(i) * 6U));
-            const uint32_t topk_id = (wire_source >> kWireSecondaryTopkShift) & kWireTopkMask;
-            const uint32_t weight_offset = uint32_t(asc_ldcg(row + 1U)) * topk + topk_id;
-            asc_stcg(out, int64_t(uint64_t(source) | (uint64_t(weight_offset) << 32U)));
-            asc_stcg(out + 1U, int64_t(asc_ldcg(row + 4U)));
-            asc_stcg(out + 2U, int64_t(asc_ldcg(row + 5U)));
-            last = out + 2U;
+        uint32_t ordinal = uint32_t(asc_ldcg(ordinals + uint64_t(source) * forward_packet_words + 16U + i));
+        if (segments > 1U) {
+            const uint32_t chunk_begin =
+                chunk < splits ? (chunk * first + splits - 1U) / splits : (chunk + 1U - splits) * chunk_tokens;
+            const uint32_t segment = (token - chunk_begin) / ascend_deepep::kNotifyChunkSegmentTokens;
+            const uint64_t offset = uint64_t(source) * forward_packet_words + 16U + packet_capacity +
+                                    (uint64_t(chunk) * segments + segment) * ascend_deepep::kNotifyChunkSegmentWords;
+            ordinal += uint32_t(asc_ldcg(ordinals + offset + 3U + lane));
         }
-        if (last != nullptr && output == uint32_t(asc_ldcg(bounds + 1U))) {
-            const uint64_t flag = uint64_t(group * chunks + chunk + 1U) << 32U;
-            asc_stcg(last, int64_t(uint64_t(asc_ldcg(last)) | flag));
-        }
+        const uint32_t output = uint32_t(asc_ldcg(offsets + task)) + uint32_t(asc_ldcg(bounds)) + ordinal;
+        auto* out = packets + uint64_t(lane) * packet_words + 8U + uint64_t(output) * 3U;
+        // Prefix and stable lane ordinal give each row a unique output, including
+        // the chunk-tail marker. The received wire slots remain immutable.
+        const uint32_t wire_source = uint32_t(asc_ldcg(received + 16U + uint64_t(i) * 6U));
+        const uint32_t topk_id = (wire_source >> kWireSecondaryTopkShift) & kWireTopkMask;
+        const uint32_t weight_offset = token * topk + topk_id;
+        const uint64_t flag =
+            output + 1U == uint32_t(asc_ldcg(bounds + 1U)) ? uint64_t(group * chunks + chunk + 1U) << 32U : 0U;
+        asc_stcg(out, int64_t(uint64_t(source) | (uint64_t(weight_offset) << 32U)));
+        asc_stcg(out + 1U, int64_t(asc_ldcg(row + 4U)));
+        asc_stcg(out + 2U, int64_t(uint64_t(gather) | flag));
     }
     asc_threadfence();
 }
@@ -1170,7 +1301,7 @@ __aicore__ inline void PrefixLocalTopkCached(__gm__ int32_t* matrix, __gm__ int3
 
 namespace diagnostics = ascend_deepep::notify_diagnostics;
 // Profile-only UB: one 512B row owned by this AIV, exported once to disjoint GM.
-// Ordinary path: 8KiB communication + 96KiB metadata + 24KiB bases/routes UB.
+// Ordinary path: 8KiB communication + 176KiB metadata + 24KiB bases/routes UB.
 // Scalar stamps follow existing VF drains; entry alignment is diagnostic-only.
 template <bool Enabled>
 struct NotifyProfile {
@@ -1204,6 +1335,11 @@ struct NotifyProfile {
     {
         words.SetValue(diagnostics::kHeaderWords + phase, GetSystemCycle());
     }
+    __aicore__ inline void Skip(uint32_t begin, uint32_t end)
+    {
+        const uint64_t stamp = GetSystemCycle();
+        for (uint32_t phase = begin; phase <= end; ++phase) words.SetValue(diagnostics::kHeaderWords + phase, stamp);
+    }
     __aicore__ inline void AlignRanks()
     {
         // Diagnostic-only collective. It reduces launch skew but does not calibrate
@@ -1228,10 +1364,66 @@ struct NotifyProfile<false> {
     __aicore__ inline void Init(TPipe&, GM_ADDR, uint64_t, const NotifyTiling&, uint32_t) {}
     __aicore__ inline void AlignRanks() {}
     __aicore__ inline void Mark(uint32_t) {}
+    __aicore__ inline void Skip(uint32_t, uint32_t) {}
     __aicore__ inline void Save() {}
 };
 
-template <uint32_t CoreCount, bool ProfileEnabled = false>
+template <uint32_t CoreCount>
+__simt_vf__ __launch_bounds__(128) inline void NotifyFinalizeOutputsVf(__gm__ int32_t* totals, __gm__ int32_t* output,
+                                                                       uint32_t experts, __gm__ uint32_t* plan,
+                                                                       uint32_t header_words, uint64_t mailbox_offset,
+                                                                       uint32_t mailbox_words, uint32_t core)
+{
+    const uint32_t worker = threadIdx.x * CoreCount + core;
+    for (uint32_t i = worker; i < experts; i += CoreCount * 128U) asc_stcg(output + i, asc_ldcg(totals + i));
+    if (plan != nullptr) {
+        // All valid row/prefix ranges are overwritten by the plan builders.
+        // Only headers and generation mailboxes need initialization.
+        for (uint32_t i = worker; i < header_words; i += CoreCount * 128U) asc_stcg(plan + i, 0U);
+        auto* mailbox = reinterpret_cast<__gm__ uint32_t*>(reinterpret_cast<__gm__ uint8_t*>(plan) + mailbox_offset);
+        for (uint32_t i = worker; i < mailbox_words; i += CoreCount * 128U) asc_stcg(mailbox + i, 0U);
+    }
+    asc_threadfence();
+}
+
+template <uint32_t CoreCount, bool Profile>
+__aicore__ inline void FinishNotify(GM_ADDR workspace, GM_ADDR dst, const NotifyTiling& t,
+                                    NotifyProfile<Profile>& profile)
+{
+    // CountExchange and ForwardExchange already retired count_send readers.
+    // Publish local final outputs and reuse UB without another cross-rank join.
+    profile.Mark(diagnostics::FinalizeOutputs);
+    asc_vf_call<NotifyFinalizeOutputsVf<CoreCount>>(
+        dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.expert_totals),
+        reinterpret_cast<__gm__ int32_t*>(t.expert_totals_output), t.experts, nullptr, 0U, 0U, 0U, GetBlockIdx());
+    SetFlag<HardEvent::V_MTE2>(EVENT_ID2);
+    WaitFlag<HardEvent::V_MTE2>(EVENT_ID2);
+    // Construction is included in ForwardCount/Prefix/Write/Exchange. Keep
+    // the old diagnostic slot empty so it cannot imply a tail plan kernel.
+    profile.Skip(diagnostics::DispatchPlan, diagnostics::DispatchPlan);
+    profile.Mark(diagnostics::End);
+    profile.Save();
+}
+
+template <uint32_t CoreCount>
+__simt_vf__ __launch_bounds__(128) inline void NotifyClearRankGatherVf(__gm__ int32_t* prefix, __gm__ int32_t* gathered,
+                                                                       __gm__ int32_t* backward_counts,
+                                                                       __gm__ int32_t* masks, uint32_t world,
+                                                                       uint32_t chunks, uint32_t core)
+{
+    const uint32_t worker = threadIdx.x * CoreCount + core;
+    const uint32_t lanes = world < 8U ? world : 8U;
+    const uint32_t groups = world / (world < 64U ? world : 64U);
+    for (uint32_t i = worker; i <= world; i += CoreCount * kNotifySimtThreads) {
+        asc_stcg(prefix + i, int32_t(0));
+        if (i < world) asc_stcg(gathered + i, int32_t(0));
+    }
+    if (worker < lanes) asc_stcg(backward_counts + worker, int32_t(0));
+    for (uint32_t i = worker; i < groups * chunks; i += CoreCount * kNotifySimtThreads) asc_stcg(masks + i, int32_t(0));
+    asc_threadfence();
+}
+
+template <uint32_t CoreCount, bool ProfileEnabled = false, bool RankDedup = false>
 __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta_address, GM_ADDR hist_address,
                                   GM_ADDR bases_address, GM_ADDR prefix_address, GM_ADDR counts_address,
                                   GM_ADDR gateways_address, GM_ADDR local_dst, GM_ADDR mask, GM_ADDR dst,
@@ -1251,7 +1443,22 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     auto scratch = scratch_buffer.Get<uint8_t>();
     TBuf<TPosition::VECIN> forward_meta_buffer;
     TBuf<TPosition::VECIN> forward_bases_buffer;
-    static_assert(ascend_deepep::kNotifyDynamicUbBytes + (ProfileEnabled ? diagnostics::kUbBytes : 0U) <= 216U * 1024U);
+    TBuf<TPosition::VECCALC> dispatch_plan_buffer;
+    LocalTensor<int32_t> dispatch_plan_ub;
+    static_assert(ascend_deepep::kNotifyDynamicUbBytes + ascend_deepep::kNotifyDispatchPlanUbBytes +
+                      (ProfileEnabled ? diagnostics::kUbBytes : 0U) <=
+                  216U * 1024U);
+    const auto& dp = t.dispatch_plan;
+    if (dp.address) {
+        pipe.InitBuffer(dispatch_plan_buffer, ascend_deepep::kNotifyDispatchPlanUbBytes);
+        dispatch_plan_ub = dispatch_plan_buffer.Get<int32_t>();
+        asc_vf_call<NotifyDispatchInitVf<CoreCount>>(
+            dim3(128), reinterpret_cast<__gm__ uint32_t*>(dp.address), uint32_t(dp.rows_offset / 4U), dp.mailbox_offset,
+            ascend_deepep::kClosSplitMailboxBytes / 4U, uint32_t(dp.phase_bytes / 4U),
+            ascend_deepep::DefaultClosPeerTableOptions(t.world), core);
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    }
     pipe.InitBuffer(forward_meta_buffer, ascend_deepep::kNotifyForwardMetaUbBytes);
     pipe.InitBuffer(forward_bases_buffer, ascend_deepep::kNotifyForwardBasesUbBytes);
     auto forward_meta_ub = forward_meta_buffer.Get<int32_t>();
@@ -1293,10 +1500,10 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         if (t.cache_parse_routes != 0U) {
             // bases UB is available for cached routes until the forward phase.
             auto* routes_ub = reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr());
-            asc_vf_call<ParseLocalTopkTokensVf<CoreCount>>(
+            asc_vf_call<ParseLocalTopkTokensVf<CoreCount, RankDedup>>(
                 dim3(128), reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(input),
-                reinterpret_cast<__gm__ int64_t*>(mask), meta, t.world, t.tokens, t.topk, t.experts, t.chunk_tokens,
-                core, routes_ub);
+                reinterpret_cast<__gm__ int64_t*>(mask), meta, t.rank, t.world, t.tokens, t.topk, t.experts,
+                t.chunk_tokens, core, routes_ub);
             SetFlag<HardEvent::V_S>(EVENT_ID2);
             WaitFlag<HardEvent::V_S>(EVENT_ID2);
             // 下一 VF 的 tile 线程读取多个 token 线程的结果，显式保护 V 到 V 依赖。
@@ -1308,9 +1515,9 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
             SetFlag<HardEvent::V_MTE2>(EVENT_ID3);
             WaitFlag<HardEvent::V_MTE2>(EVENT_ID3);
         } else {
-            asc_vf_call<ParseLocalTopkVf<true, CoreCount>>(
+            asc_vf_call<ParseLocalTopkVf<true, CoreCount, RankDedup>>(
                 dim3(128), reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(input),
-                reinterpret_cast<__gm__ int64_t*>(mask), meta, hist, t.world, t.tokens, t.topk, t.experts,
+                reinterpret_cast<__gm__ int64_t*>(mask), meta, hist, t.rank, t.world, t.tokens, t.topk, t.experts,
                 t.chunk_tokens, core, reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()));
         }
         SetFlag<HardEvent::V_MTE3>(EVENT_ID3);
@@ -1327,10 +1534,10 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
         WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
     } else {
-        asc_vf_call<ParseLocalTopkVf<false, CoreCount>>(
+        asc_vf_call<ParseLocalTopkVf<false, CoreCount, RankDedup>>(
             dim3(128), reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(input),
-            reinterpret_cast<__gm__ int64_t*>(mask), meta, hist, t.world, t.tokens, t.topk, t.experts, t.chunk_tokens,
-            core, reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()));
+            reinterpret_cast<__gm__ int64_t*>(mask), meta, hist, t.rank, t.world, t.tokens, t.topk, t.experts,
+            t.chunk_tokens, core, reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()));
     }
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
@@ -1449,26 +1656,26 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
                 Duplicate(forward_bases_ub[t.forward_count_offset_words], int32_t(0), local_tiles * t.world);
                 PipeBarrier<PIPE_V>();
             }
-            asc_vf_call<NotifyForwardTilesVf<false, true, true, CoreCount, true>>(
+            asc_vf_call<NotifyForwardTilesVf<false, true, true, CoreCount, true, RankDedup>>(
                 dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
                 t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
                 reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
         } else if (t.forward_plan_offset_words != 0U) {
-            asc_vf_call<NotifyForwardTilesVf<false, true, true, CoreCount>>(
+            asc_vf_call<NotifyForwardTilesVf<false, true, true, CoreCount, false, RankDedup>>(
                 dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
                 t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
                 reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
         } else {
-            asc_vf_call<NotifyForwardTilesVf<false, true, false, CoreCount>>(
+            asc_vf_call<NotifyForwardTilesVf<false, true, false, CoreCount, false, RankDedup>>(
                 dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
                 t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
                 reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
         }
     } else {
-        asc_vf_call<NotifyForwardTilesVf<false, false, false, CoreCount>>(
+        asc_vf_call<NotifyForwardTilesVf<false, false, false, CoreCount, false, RankDedup>>(
             dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
             t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
             reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
@@ -1490,9 +1697,41 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         SetFlag<HardEvent::V_S>(EVENT_ID2);
         WaitFlag<HardEvent::V_S>(EVENT_ID2);
     }
+    if (dp.address) {
+        // Input meta/bases and gateway prefixes are already published. Never
+        // read another AIV's dst stores from the preceding ResolveDst call.
+        if (t.forward_plan_offset_words != 0U) {
+            asc_vf_call<NotifyDispatchRowsVf<false, CoreCount, true, true>>(
+                dim3(128), meta, hist, local_segments, gateways, bases,
+                reinterpret_cast<__gm__ int32_t*>(dp.address + 64U),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.rows_offset),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.scratch_offset), t.rank, t.world, t.tokens, t.topk,
+                t.experts, RankDedup ? 1U : 8U, core, reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
+                forward_plan);
+        } else if (cache_forward) {
+            asc_vf_call<NotifyDispatchRowsVf<false, CoreCount, true>>(
+                dim3(128), meta, hist, local_segments, gateways, bases,
+                reinterpret_cast<__gm__ int32_t*>(dp.address + 64U),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.rows_offset),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.scratch_offset), t.rank, t.world, t.tokens, t.topk,
+                t.experts, RankDedup ? 1U : 8U, core, reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
+                forward_plan);
+        } else {
+            asc_vf_call<NotifyDispatchRowsVf<false, CoreCount>>(
+                dim3(128), meta, hist, local_segments, gateways, bases,
+                reinterpret_cast<__gm__ int32_t*>(dp.address + 64U),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.rows_offset),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.scratch_offset), t.rank, t.world, t.tokens, t.topk,
+                t.experts, RankDedup ? 1U : 8U, core, reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
+                forward_plan);
+        }
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    }
     profile.Mark(diagnostics::LocalWaitResolveDst);
     SyncAll<true>();
     profile.Mark(diagnostics::ForwardPrefix);
+    if (dp.address) NotifyDispatchPrefix<CoreCount>(t, dispatch_plan_ub);
     // count 交换已排空，此处复用通信 scratch，不覆盖仍供 row writer 使用的 meta/plan。
     // 每核拥有 gateway=core,core+CoreCount,...，每个 UB 行起点按 32B 对齐。
     const uint32_t prefix_stride = t.forward_prefix_ub_stride;
@@ -1532,30 +1771,31 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     profile.Mark(diagnostics::LocalWaitForwardPrefix);
     SyncAll<true>();
     profile.Mark(diagnostics::ForwardWrite);
+    if (dp.address) NotifyDispatchDirectory<CoreCount>(t, dispatch_plan_ub);
     if (t.forward_plan_offset_words != 0U) {
         // count VF 写出的 UB 计划将由同核不同线程读取，显式保证 V 到 V 的依赖。
         PipeBarrier<PIPE_V>();
         if (t.forward_token_prefix_offset_words != 0U) {
-            asc_vf_call<NotifyForwardRowsVf<true, CoreCount>>(
+            asc_vf_call<NotifyForwardRowsVf<true, CoreCount, RankDedup>>(
                 dim3(128), forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send), t.rank,
                 t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
                 reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_token_prefix);
         } else {
-            asc_vf_call<NotifyForwardRowsVf<false, CoreCount>>(
+            asc_vf_call<NotifyForwardRowsVf<false, CoreCount, RankDedup>>(
                 dim3(128), forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send), t.rank,
                 t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
                 reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_token_prefix);
         }
     } else if (cache_forward) {
-        asc_vf_call<NotifyForwardTilesVf<true, true, false, CoreCount>>(
+        asc_vf_call<NotifyForwardTilesVf<true, true, false, CoreCount, false, RankDedup>>(
             dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
             t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
             reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
             reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
     } else {
-        asc_vf_call<NotifyForwardTilesVf<true, false, false, CoreCount>>(
+        asc_vf_call<NotifyForwardTilesVf<true, false, false, CoreCount, false, RankDedup>>(
             dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
             t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
             reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
@@ -1566,6 +1806,35 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     profile.Mark(diagnostics::LocalWaitForwardWrite);
     SyncAll<true>();
     profile.Mark(diagnostics::ForwardExchange);
+    if (dp.address) {
+        if (t.forward_plan_offset_words != 0U) {
+            asc_vf_call<NotifyDispatchEmitCachedVf<CoreCount>>(
+                dim3(128), reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()), forward_plan,
+                reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + 64U),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.rows_offset),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.scratch_offset), t.rank, t.world, t.tokens, t.topk,
+                t.experts, core);
+        } else if (cache_forward) {
+            asc_vf_call<NotifyDispatchRowsVf<true, CoreCount, true>>(
+                dim3(128), meta, hist, local_segments, gateways, bases,
+                reinterpret_cast<__gm__ int32_t*>(dp.address + 64U),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.rows_offset),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.scratch_offset), t.rank, t.world, t.tokens, t.topk,
+                t.experts, RankDedup ? 1U : 8U, core, reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
+                forward_plan);
+        } else {
+            asc_vf_call<NotifyDispatchRowsVf<true, CoreCount>>(
+                dim3(128), meta, hist, local_segments, gateways, bases,
+                reinterpret_cast<__gm__ int32_t*>(dp.address + 64U),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.rows_offset),
+                reinterpret_cast<__gm__ int32_t*>(dp.address + dp.scratch_offset), t.rank, t.world, t.tokens, t.topk,
+                t.experts, RankDedup ? 1U : 8U, core, reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
+                forward_plan);
+        }
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    }
     for (uint32_t peer = core; peer < t.world; peer += CoreCount) {
         auto* packet = workspace + t.forward_send + uint64_t(peer) * t.forward_stride;
         NotifyTransfer(workspace + t.forward_recv + uint64_t(t.rank) * t.forward_stride, packet,
@@ -1573,31 +1842,43 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     }
     profile.Mark(diagnostics::GlobalWaitForwardExchange);
     aclshmemx_barrier_all_vec();
-    profile.Mark(diagnostics::GatherCount);
-    asc_vf_call<NotifyGatherCountTilesVf<CoreCount>>(
-        dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets,
-        reinterpret_cast<__gm__ int32_t*>(forward), t.rank, t.world, t.forward_capacity, t.forward_stride / 4U, core);
-    SetFlag<HardEvent::V_S>(EVENT_ID2);
-    WaitFlag<HardEvent::V_S>(EVENT_ID2);
-    profile.Mark(diagnostics::LocalWaitGatherCount);
-    SyncAll<true>();
-    profile.Mark(diagnostics::GatherSourcePrefix);
-    asc_vf_call<NotifyGatherSourcePrefixVf<CoreCount>>(
-        dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets, prefix, t.world,
-        t.forward_capacity, t.forward_stride / 4U, core);
-    SetFlag<HardEvent::V_S>(EVENT_ID2);
-    WaitFlag<HardEvent::V_S>(EVENT_ID2);
-    profile.Mark(diagnostics::LocalWaitGatherSourcePrefix);
-    SyncAll<true>();
-    profile.Mark(diagnostics::GatherPrefix);
-    asc_vf_call<NotifyGatherPrefixVf<CoreCount>>(
-        dim3(128), prefix, reinterpret_cast<__gm__ int32_t*>(workspace + t.gather_send), t.rank, t.world, core);
-    SetFlag<HardEvent::V_S>(EVENT_ID2);
-    WaitFlag<HardEvent::V_S>(EVENT_ID2);
-    profile.Mark(diagnostics::LocalWaitGatherPrefix);
-    SyncAll<true>();
-    profile.Mark(diagnostics::BuildForwardRows);
-    asc_vf_call<NotifyBuildForwardRowsVf<CoreCount>>(
+    if constexpr (RankDedup) {
+        profile.Skip(diagnostics::GatherCount, diagnostics::LocalWaitGatherPrefix);
+        profile.Mark(diagnostics::BuildForwardRows);
+        asc_vf_call<NotifyClearRankGatherVf<CoreCount>>(
+            dim3(128), prefix, reinterpret_cast<__gm__ int32_t*>(gather_rows),
+            reinterpret_cast<__gm__ int32_t*>(backward_counts), reinterpret_cast<__gm__ int32_t*>(masks), t.world,
+            t.chunks, core);
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    } else {
+        profile.Mark(diagnostics::GatherCount);
+        asc_vf_call<NotifyGatherCountTilesVf<CoreCount>>(
+            dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets,
+            reinterpret_cast<__gm__ int32_t*>(forward), t.rank, t.world, t.forward_capacity, t.forward_stride / 4U,
+            core);
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
+        profile.Mark(diagnostics::LocalWaitGatherCount);
+        SyncAll<true>();
+        profile.Mark(diagnostics::GatherSourcePrefix);
+        asc_vf_call<NotifyGatherSourcePrefixVf<CoreCount>>(
+            dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets, prefix, t.world,
+            t.forward_capacity, t.forward_stride / 4U, core);
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
+        profile.Mark(diagnostics::LocalWaitGatherSourcePrefix);
+        SyncAll<true>();
+        profile.Mark(diagnostics::GatherPrefix);
+        asc_vf_call<NotifyGatherPrefixVf<CoreCount>>(
+            dim3(128), prefix, reinterpret_cast<__gm__ int32_t*>(workspace + t.gather_send), t.rank, t.world, core);
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
+        profile.Mark(diagnostics::LocalWaitGatherPrefix);
+        SyncAll<true>();
+    }
+    if constexpr (!RankDedup) profile.Mark(diagnostics::BuildForwardRows);
+    asc_vf_call<NotifyBuildForwardRowsVf<CoreCount, RankDedup>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets, prefix,
         reinterpret_cast<__gm__ int32_t*>(forward), reinterpret_cast<__gm__ int32_t*>(forward_counts),
         reinterpret_cast<__gm__ int32_t*>(weight_return_meta), t.rank, t.world, t.forward_capacity,
@@ -1606,16 +1887,35 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
     profile.Mark(diagnostics::ChunkRangesBackwardCount);
     // chunk 信息直接读取接收包，不依赖其他核写完 forward 表。
+    // ForwardExchange drained every MTE reader and remote store before its
+    // collective. Reuse only the released send payload for one int32 per row;
+    // it reserves six int32 per row and no peer writes into this local region.
+    auto* backward_ordinals = reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send);
     asc_vf_call<NotifyChunkRangesVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv),
         reinterpret_cast<__gm__ int32_t*>(forward), t.forward_capacity, reinterpret_cast<__gm__ int32_t*>(ranges),
-        reinterpret_cast<__gm__ int32_t*>(workspace + t.source_chunk_masks), backward_task_offsets, t.rank, t.world,
-        t.chunks, t.chunk_tokens, t.tokens, t.forward_stride / 4U, core);
+        reinterpret_cast<__gm__ int32_t*>(workspace + t.source_chunk_masks), backward_task_offsets, backward_ordinals,
+        t.rank, t.world, t.chunks, t.chunk_tokens, t.tokens, t.forward_stride / 4U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
-    // Publish both forward rows and fused lane counts before prefix consumers.
+    if (ascend_deepep::NotifyChunkSegments(t.forward_capacity, t.chunks, t.chunk_tokens) > 1U) {
+        // All segments of a chunk and its prefix belong to this same AIV.
+        PipeBarrier<PIPE_V>();
+        asc_vf_call<NotifyPrefixChunkSegmentsVf<CoreCount>>(
+            dim3(128), backward_ordinals, reinterpret_cast<__gm__ int32_t*>(ranges),
+            reinterpret_cast<__gm__ int32_t*>(workspace + t.source_chunk_masks), backward_task_offsets,
+            t.forward_capacity, t.world, t.chunks, t.chunk_tokens, t.forward_stride / 4U, core);
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    }
+    // Publish forward rows, lane counts and stable ordinals before consumers.
     profile.Mark(diagnostics::LocalWaitBuildForwardRows);
     SyncAll<true>();
+    if constexpr (RankDedup) {
+        profile.Skip(diagnostics::BackwardChunkPrefix, diagnostics::CollectBackward);
+        FinishNotify<CoreCount>(workspace, dst, t, profile);
+        return;
+    }
     profile.Mark(diagnostics::BackwardChunkPrefix);
     asc_vf_call<NotifyPrefixBackwardChunksVf<CoreCount>>(
         dim3(128), backward_task_offsets, backward_group_offsets,
@@ -1635,10 +1935,10 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     SyncAll<true>();
     profile.Mark(diagnostics::BackwardWrite);
     asc_vf_call<NotifyWriteBackwardTasksVf<CoreCount>>(
-        dim3(128), reinterpret_cast<__gm__ int32_t*>(forward), reinterpret_cast<__gm__ int32_t*>(ranges),
-        backward_task_offsets, backward_group_offsets, reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_send),
-        reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), t.rank, t.world, t.chunks, t.topk,
-        t.forward_capacity, t.backward_stride / 8U, t.forward_stride / 4U, core);
+        dim3(128), reinterpret_cast<__gm__ int32_t*>(forward), backward_ordinals, backward_task_offsets,
+        backward_group_offsets, reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_send),
+        reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), t.rank, t.world, t.chunks, t.chunk_tokens,
+        t.tokens, t.topk, t.forward_capacity, t.backward_stride / 8U, t.forward_stride / 4U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
     profile.Mark(diagnostics::LocalWaitBackwardWrite);
@@ -1665,8 +1965,7 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         t.backward_stride / 8U, core, t.tokens);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
-    profile.Mark(diagnostics::End);
-    profile.Save();
+    FinishNotify<CoreCount>(workspace, dst, t, profile);
 }
 #endif
 }  // namespace
@@ -1691,13 +1990,25 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_full_
     util_set_ffts_config(0U);
     // 核数在入口选择编译期特化，SIMT 热循环中的除法仍可优化成常量移位。
     if (t.num_cores == 64U) {
-        FullNotify<64U>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst, forward,
-                        forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
-                        weight_return_meta, t);
+        if (t.rank_dedup) {
+            FullNotify<64U, false, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask,
+                                         dst, forward, forward_counts, backward, backward_counts, ranges, masks,
+                                         rank_rows, gather_rows, weight_return_meta, t);
+        } else {
+            FullNotify<64U>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
+                            forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
+                            weight_return_meta, t);
+        }
     } else {
-        FullNotify<32U>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst, forward,
-                        forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
-                        weight_return_meta, t);
+        if (t.rank_dedup) {
+            FullNotify<32U, false, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask,
+                                         dst, forward, forward_counts, backward, backward_counts, ranges, masks,
+                                         rank_rows, gather_rows, weight_return_meta, t);
+        } else {
+            FullNotify<32U>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
+                            forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
+                            weight_return_meta, t);
+        }
     }
 #endif
 }
@@ -1710,7 +2021,10 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_full_kernel_do(
 {
     // SIMD 主核调用的 SIMT VF 也访问这些 TPipe buffer，必须在启动时声明动态 UB 范围。
     const auto& config = *reinterpret_cast<ascend_deepep::NotifyTiling*>(tiling);
-    notify_full_kernel<<<config.num_cores, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(ascend_deepep::kNotifyDynamicUbBytes),
+    notify_full_kernel<<<config.num_cores,
+                         ASCEND_DEEPEP_KERNEL_LAUNCH_UB(
+                             ascend_deepep::kNotifyDynamicUbBytes +
+                             (config.dispatch_plan.address ? ascend_deepep::kNotifyDispatchPlanUbBytes : 0U)),
                          stream>>>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
                                    forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows,
                                    gather_rows, weight_return_meta, config);
@@ -1726,13 +2040,25 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_profi
     util_set_ffts_config(0U);
     // 核数在入口选择编译期特化，SIMT 热循环中的除法仍可优化成常量移位。
     if (t.num_cores == 64U) {
-        FullNotify<64U, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
-                              forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
-                              weight_return_meta, t, profile, sample);
+        if (t.rank_dedup) {
+            FullNotify<64U, true, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask,
+                                        dst, forward, forward_counts, backward, backward_counts, ranges, masks,
+                                        rank_rows, gather_rows, weight_return_meta, t, profile, sample);
+        } else {
+            FullNotify<64U, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
+                                  forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows,
+                                  gather_rows, weight_return_meta, t, profile, sample);
+        }
     } else {
-        FullNotify<32U, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
-                              forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
-                              weight_return_meta, t, profile, sample);
+        if (t.rank_dedup) {
+            FullNotify<32U, true, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask,
+                                        dst, forward, forward_counts, backward, backward_counts, ranges, masks,
+                                        rank_rows, gather_rows, weight_return_meta, t, profile, sample);
+        } else {
+            FullNotify<32U, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
+                                  forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows,
+                                  gather_rows, weight_return_meta, t, profile, sample);
+        }
     }
 #endif
 }
@@ -1747,8 +2073,9 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_profile_kernel_do(
     // SIMD 主核调用的 SIMT VF 也访问这些 TPipe buffer，必须在启动时声明动态 UB 范围。
     const auto& config = *reinterpret_cast<ascend_deepep::NotifyTiling*>(tiling);
     notify_profile_kernel<<<config.num_cores,
-                            ASCEND_DEEPEP_KERNEL_LAUNCH_UB(ascend_deepep::kNotifyDynamicUbBytes +
-                                                           ascend_deepep::notify_diagnostics::kUbBytes),
+                            ASCEND_DEEPEP_KERNEL_LAUNCH_UB(
+                                ascend_deepep::kNotifyDynamicUbBytes + ascend_deepep::notify_diagnostics::kUbBytes +
+                                (config.dispatch_plan.address ? ascend_deepep::kNotifyDispatchPlanUbBytes : 0U)),
                             stream>>>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask,
                                       dst, forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows,
                                       gather_rows, weight_return_meta, profile, sample, config);
@@ -1757,34 +2084,4 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_profile_kernel_do(
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_barrier_kernel_do(void* stream, uint32_t num_cores)
 {
     notify_dispatch_barrier_kernel<<<num_cores, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>();
-}
-
-namespace {
-#include "../dispatch/peer_io.hpp"
-#include "../dispatch/peer_plan.hpp"
-}  // namespace
-
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispatch_peer_plan_kernel(
-    GM_ADDR workspace, GM_ADDR dst, GM_ADDR forward, GM_ADDR counts, GM_ADDR plan, ascend_deepep::DispatchTiling t,
-    uint64_t stride_offset)
-{
-    util_set_ffts_config(0U);
-#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    // Decode Notify's actual row stride; the generated table stores unencoded rows.
-    GlobalTensor<int32_t> stride;
-    stride.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspace + stride_offset));
-    stride.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
-    t.rows = stride.GetValue(0);
-    t.address_stride = t.rows;
-    PreparePeerPlan(workspace, dst, forward, counts, plan, t);
-#endif
-}
-extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_peer_plan_kernel_do(void* stream, uint8_t* workspace, uint8_t* dst,
-                                                                         uint8_t* forward, uint8_t* counts,
-                                                                         uint8_t* plan, uint8_t* tiling,
-                                                                         uint64_t stride_offset)
-{
-    const auto t = *reinterpret_cast<ascend_deepep::DispatchTiling*>(tiling);
-    notify_dispatch_peer_plan_kernel<<<32, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(8192), stream>>>(
-        workspace, dst, forward, counts, plan, t, stride_offset);
 }

@@ -208,8 +208,7 @@ private:
         } else {
             // Compact every 480B payload block, skipping the 32B GM Flag.
             // GM source stride is bytes; UB destination stride is 32B blocks.
-            DataCopyPad(wire, source, {uint16_t(data_.blockCount), 480U, 32U, 0U, 0U},
-                        {false, 0U, 0U, 0});
+            DataCopyPad(wire, source, {uint16_t(data_.blockCount), 480U, 32U, 0U, 0U}, {false, 0U, 0U, 0});
         }
         SetFlag<HardEvent::MTE2_MTE3>(lane);
         // Publish immediately after this load, before queuing later loads.
@@ -227,8 +226,7 @@ private:
             // Compact offsets are logical payload offsets. Retain this lane
             // until all payload, scale and metadata output reads complete.
             WaitFlag<HardEvent::MTE2_MTE3>(lane);
-            DataCopyPad(expandX_[uint64_t(row) * hiddenBytes_], wire,
-                        {1U, hiddenBytes_, 0U, 0U, 0U});
+            DataCopyPad(expandX_[uint64_t(row) * hiddenBytes_], wire, {1U, hiddenBytes_, 0U, 0U, 0U});
             if constexpr (WireFp8)
                 DataCopyPad(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire[uint32_t(data_.quantCount)],
                             {1U, uint32_t(data_.scaleBytes), 0U, 0U, 0U});
@@ -240,17 +238,18 @@ private:
         auto type = wire[uint32_t(data_.tokenStride)].template ReinterpretCast<uint32_t>();
         auto destination = wire[uint32_t(data_.tokenStride) + 32U].template ReinterpretCast<uint32_t>();
         ServerDedupPacketTail tail(wire, headerOffset,
-                                  uint32_t(keepFlags ? data_.relayReadIndexWireOffset : data_.readIndexPayloadOffset));
-        const bool firstHop = enableDedup_ &&
-                              tail.Header().GetValue(3U) == uint32_t(EpServerDedupTokenType::FirstHop);
-        if (enableDedup_) BuildServerDedupMetadata(type, destination, tail, tasks_.Position(j));
-        else for (uint32_t i = 0U; i < 3U; ++i) destination.SetValue(i, tail.Header().GetValue(i));
+                                   uint32_t(keepFlags ? data_.relayReadIndexWireOffset : data_.readIndexPayloadOffset));
+        const bool firstHop = enableDedup_ && tail.Header().GetValue(3U) == uint32_t(EpServerDedupTokenType::FirstHop);
+        if (enableDedup_)
+            BuildServerDedupMetadata(type, destination, tail, tasks_.Position(j));
+        else
+            for (uint32_t i = 0U; i < 3U; ++i) destination.SetValue(i, tail.Header().GetValue(i));
         if (firstHop) {
             PrepareServerDedupForward(tail);
             // Forwarded packets only need compact payload. The hint remains
             // independent of the application-level token type in the header.
-            wire.template ReinterpretCast<float>().SetValue(
-                PacketReceiveLayout::kMarkerOffset / 4U, PacketReceiveLayout::kCompact);
+            wire.template ReinterpretCast<float>().SetValue(PacketReceiveLayout::kMarkerOffset / 4U,
+                                                            PacketReceiveLayout::kCompact);
         }
         ServerDedupReceiveSync<HardEvent::S_MTE3>();
         WaitFlag<HardEvent::MTE2_MTE3>(lane);

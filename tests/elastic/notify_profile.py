@@ -7,7 +7,7 @@ from pathlib import Path
 import statistics
 
 MAGIC = 0x4E544659
-VERSION = 1
+VERSION = 2
 WORDS = 64
 HEADER_WORDS = 16
 TICKS_PER_US = 1000  # Ascend950 GetSystemCycle system counter, as in Combine.
@@ -57,13 +57,15 @@ PHASES = (
     "BackwardGatherExchange",
     "GlobalWaitBackwardGatherExchange",
     "CollectBackward",
+    "FinalizeOutputs",
+    "DispatchPlan",
 )
 COLORS = dict(compute="#478ac6", exchange="#32a58b", local_wait="#efa645", global_wait="#d16d85")
 NOTES = [
     "Instrumented invocation; use the separate notify_full_kernel profiler samples for performance.",
     "Diagnostic-only entry barrier reduces launch skew. Time zero is its earliest AIV exit on this rank; device clocks are not calibrated.",
     "Work stages include their existing VF/MTE drains. Wait stages measure existing barriers, not pure wire latency.",
-    "FullNotify only: excludes final profile export, host-launched post-Notify barrier, peer-plan kernel and totals copy.",
+    "Notify includes publication and totals export; private Dispatch planning, when requested, runs inside ForwardCount/Prefix/Write/Exchange. DispatchPlan is reserved and empty after integration.",
 ]
 
 

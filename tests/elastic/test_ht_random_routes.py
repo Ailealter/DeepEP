@@ -40,7 +40,7 @@ def test_random_reproducibility_and_duplicate_slots():
     assert routes != dispatch.make_routes(16, 17, 16, 32, 0, "normal")
     assert any(len(set(row)) < len(row) for rows in routes for row in rows)
     assert all(len(row) == 16 and all(0 <= expert < 32 for expert in row) for rows in routes for row in rows)
-    golden = dispatch.build_notify_golden(routes, 32, 256)
+    golden = dispatch.build_notify_golden(routes, 32, 256, rank_dedup=False)
     assert sum(golden["rank_rows"]) == 16 * 17 * 16
     assert sum(golden["gather_rows"]) > 0
     assert len(set(golden["rank_rows"])) > 1

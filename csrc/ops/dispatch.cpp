@@ -112,13 +112,17 @@ void bind_dispatch(py::module_& module)
         }
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
         auto config = t;
+        if (tensors.contains("dedup_group_size")) {
+            config.dedup_group_size = tensors["dedup_group_size"].cast<uint32_t>();
+            if (config.dedup_group_size != 1U && config.dedup_group_size != 8U)
+                throw std::invalid_argument("Dispatch dedup_group_size must be 1 or 8");
+        }
         config.input_address = reinterpret_cast<uint64_t>(input);
         config.output_address = reinterpret_cast<uint64_t>(output);
         config.output_weights_address = reinterpret_cast<uint64_t>(out_weights);
         config.output_scales_address = reinterpret_cast<uint64_t>(out_scales);
-        if (tensors.contains("rotation_wqes")) config.rotation_wqes = tensors["rotation_wqes"].cast<uint32_t>();
-        if (config.rotation_wqes != 4U && config.rotation_wqes != 16U)
-            throw std::invalid_argument("Diagnostic rotation_wqes supports 4 or 16");
+        if (tensors.contains("rotation_wqes") && tensors["rotation_wqes"].cast<uint32_t>() != 4U)
+            throw std::invalid_argument("Dispatch publishes four WQEs per doorbell");
         if (tensors.contains("detail_profile") && !tensors["detail_profile"].is_none()) {
             config.detail_profile =
                 reinterpret_cast<uint64_t>(pointer(tensors["detail_profile"], {64, 32}, "int64", device));
@@ -140,6 +144,10 @@ void bind_dispatch(py::module_& module)
         if (config.detail_profile && !config.profile)
             throw std::invalid_argument("Detail diagnostics require main profile");
         const bool measure = tensors.contains("kernel_timing") && tensors["kernel_timing"].cast<bool>();
+        // Explicit benchmark alignment only. Timing/profiling does not change
+        // the production synchronization contract by itself.
+        const bool benchmark_barriers =
+            tensors.contains("benchmark_barriers") && tensors["benchmark_barriers"].cast<bool>();
         if (tensors.contains("plan") && !tensors["plan"].is_none()) {
             if (!session.peer_table()) throw std::invalid_argument("peer-table session required");
             config.peer_table = reinterpret_cast<uint64_t>(
@@ -150,11 +158,6 @@ void bind_dispatch(py::module_& module)
         if (!config.peer_table) throw std::invalid_argument("Dispatch requires a prepared peer table");
         py::gil_scoped_release release;
         DevicePhaseTiming timing(measure);
-        // Preserve the peer-ready lifetime contract: prior device work on EVERY
-        // rank must finish before any rank reuses its control/aggregate workspace.
-        // This host join is outside Events, and applies to ordinary calls too.
-        if (aclrtSynchronizeStream(stream) != 0) throw std::runtime_error("Dispatch reuse sync failed");
-        session.barrier();
         const Session::DispatchControlLayout controls{t.sync,
                                                       t.inbox,
                                                       t.inbox_stride,
@@ -171,6 +174,9 @@ void bind_dispatch(py::module_& module)
             // all packet flags, not only headers: untouched heap bytes must never
             // masquerade as this Session's first generation. Cached calls retain
             // older generations and skip this untimed full-inbox clear.
+            // This is lazy initialization, not per-call synchronization.
+            if (aclrtSynchronizeStream(stream) != 0) throw std::runtime_error("Dispatch reuse sync failed");
+            session.barrier();
             session.invalidate_dispatch_controls();
             auto clear = [&](uint64_t offset, uint64_t bytes) {
                 if (offset > session.capacity() / 2U || bytes > session.capacity() / 2U - offset)
@@ -180,7 +186,7 @@ void bind_dispatch(py::module_& module)
             };
             clear(t.sync, uint64_t(t.world) * 49152U + 65536U);
             clear(t.peer_book, uint64_t(t.world) * 512U);
-            clear(t.done, uint64_t(t.world) * 512U);
+            clear(t.done, uint64_t(t.world) * ascend_deepep::kDispatchCompletionLanes * 512U);
             for (uint32_t peer = 0; peer < t.world; ++peer) {
                 if (t.fp8) clear(t.inbox + uint64_t(peer) * t.inbox_stride, t.inbox_stride);
                 if (weights) clear(t.weight_inbox + uint64_t(peer) * t.weight_inbox_stride, t.weight_inbox_stride);
@@ -190,14 +196,13 @@ void bind_dispatch(py::module_& module)
             session.remember_dispatch_controls(controls);
         }
         timing.mark(0, stream);
-        // All 64 AIVs participate; timing includes these separate barrier tasks.
-        notify_dispatch_barrier_kernel_do(stream, 64U);
+        if (benchmark_barriers) notify_dispatch_barrier_kernel_do(stream, 64U);
         timing.mark(1, stream);
         dispatch_kernel_do(stream, workspace, destinations, forward, counts, weights, scales,
                            reinterpret_cast<uint8_t*>(&config));
         timing.mark(2, stream);
-        // Join inbound writes before recording the public completion event.
-        notify_dispatch_barrier_kernel_do(stream, 64U);
+        // The kernel joins incoming completion flags before its stream event.
+        if (benchmark_barriers) notify_dispatch_barrier_kernel_do(stream, 64U);
         timing.mark(3, stream);
         return timing.finish(stream);
     });

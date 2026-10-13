@@ -87,7 +87,9 @@ def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False
     weight_capacity = (routes + 59) // 60 * 60 if weights else 0
     weight_inbox_stride = 512 + weight_capacity // 60 * 512 if weight_capacity else 0
     row_bytes = hidden * (1 if fp8 else 2)
-    inbox_stride = 512 + ((tokens * topk + 1) // 2) * 512 if fp8 else 0
+    scale_shards = 32 // world if world < 32 else 1
+    shard_routes = (tokens * topk + scale_shards - 1) // scale_shards
+    inbox_stride = scale_shards * (512 + ((shard_routes + 1) // 2) * 512) if fp8 else 0
     regions = (
         ("sync", world * 49152 + 65536),
         ("book", world * 16),
@@ -97,7 +99,7 @@ def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False
         ("scales", rows * (hidden // 128) * 4 if fp8 else 0),
         ("inbox", world * inbox_stride),
         ("peer_book", world * 512),
-        ("done", world * 512),
+        ("done", world * 3 * 512),  # Clos QP0/QP1 and FM completion slots.
         ("weight_inbox", world * weight_inbox_stride),
     )
     layout, cursor = {}, notify["workspace_bytes"]
@@ -139,10 +141,9 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256, hid
     slots = 3 * world + 96 + groups * chunks * 8 + 64 + world * chunks * 2 + 64
     cursor, result = slots * 512, {"control_slot_num": slots}
     for name, count in (
-        ("expert_input", rows),
         ("gather_input", gather_rows),
         ("server_partial", rows),
-        ("returned_partial", tokens * ((world + 7) // 8)),
+        ("returned_partial", tokens * max((world + 7) // 8, topk)),
         ("output", tokens),
     ):
         result[name] = cursor

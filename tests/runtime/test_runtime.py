@@ -208,6 +208,75 @@ def test_scaleup_capacity_reaches_runtime_without_translation(monkeypatch):
     assert buffer._runtime is resource
 
 
+@pytest.mark.parametrize("option, expected", [({}, True), ({"use_1g_huge_pages": False}, False)])
+def test_elastic_huge_page_default_and_opt_out(monkeypatch, option, expected):
+    module = importlib.import_module(deep_ep.ElasticBuffer.__module__)
+    monkeypatch.setattr(module, "require_native", lambda _: None)
+    calls = []
+    monkeypatch.setattr(module, "Runtime", lambda *a, **kw: calls.append(kw) or SimpleNamespace(closed=True))
+    deep_ep.ElasticBuffer(rank=0, world_size=32, num_bytes=2 << 20, explicitly_destroy=True, **option)
+    assert calls[0]["use_1g_huge_pages"] is expected
+    assert calls[0]["debug_collectives"] is False
+
+
+def test_elastic_debug_collectives_reaches_runtime(monkeypatch):
+    module = importlib.import_module(deep_ep.ElasticBuffer.__module__)
+    monkeypatch.setattr(module, "require_native", lambda _: None)
+    calls = []
+    monkeypatch.setattr(module, "Runtime", lambda *a, **kw: calls.append(kw) or SimpleNamespace(closed=True))
+    deep_ep.ElasticBuffer(group=object(), num_bytes=2 << 20, explicitly_destroy=True, debug_collectives=True)
+    assert calls[0]["debug_collectives"] is True
+
+
+@pytest.mark.parametrize("debug", [True, 0, 1, "true", None])
+def test_debug_collectives_requires_bool_and_group(monkeypatch, debug):
+    monkeypatch.setattr(_runtime, "require_native", lambda _: None)
+    monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
+    with pytest.raises(ValueError if debug is True else TypeError, match="debug_collectives"):
+        _runtime.Runtime(None, 2 << 20, rank=0, world_size=2, debug_collectives=debug)
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "combine", "mpi", "combine-mpi"])
+@pytest.mark.parametrize("huge", [False, True])
+def test_huge_page_option_reaches_native_factory(monkeypatch, kind, huge):
+    calls = []
+
+    def factory(*args):
+        calls.append(args)
+        return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(_runtime, "_OWNER", None)
+    monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
+    monkeypatch.setattr(
+        _runtime,
+        "require_native",
+        lambda _: SimpleNamespace(
+            Runtime=factory, create_combine_runtime=factory, create_mpi_runtime=factory, runtime_busy=lambda: False
+        ),
+    )
+    monkeypatch.setattr(
+        _runtime,
+        "npu_api",
+        lambda: SimpleNamespace(
+            current_device=lambda: 0, Stream=lambda **kw: SimpleNamespace(synchronize=lambda: None)
+        ),
+    )
+    monkeypatch.setenv("PMI_RANK", "0")
+    monkeypatch.setenv("PMI_SIZE", "32")
+    runtime = _runtime.Runtime(
+        None,
+        2 << 20,
+        udma=True,
+        rank=0,
+        world_size=32,
+        bootstrap="mpi" if "mpi" in kind else "default",
+        combine_only="combine" in kind,
+        use_1g_huge_pages=huge,
+    )
+    assert len(calls) == 1 and calls[0][-1] is huge and runtime.use_1g_huge_pages is huge
+    runtime.close()
+
+
 def test_import_does_not_load_framework_or_extension():
     root = Path(deep_ep.__file__).resolve().parent.parent
     code = """
@@ -230,9 +299,10 @@ assert len(deep_ep.__all__) == 6
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("mismatch", [None, "capacity", "timeout", "endpoint", "busy", "engine"])
-def test_bootstrap_without_host_device_checks(monkeypatch, mismatch):
-    pytest.importorskip("torch")
+@pytest.mark.parametrize("mismatch", [None, "capacity", "timeout", "endpoint", "busy", "engine", "debug"])
+@pytest.mark.parametrize("debug", [False, True])
+def test_bootstrap_without_host_device_checks(monkeypatch, mismatch, debug):
+    torch = pytest.importorskip("torch")
     import torch.distributed as dist
 
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://xxx.xxx.xxx.xxx:xxxxx")
@@ -257,11 +327,14 @@ def test_bootstrap_without_host_device_checks(monkeypatch, mismatch):
         # Only collective resource settings remain; no host name or device index.
         assert local.numel() == 5
         assert local.tolist()[:2] == [2 << 20, 120]
-        assert local.tolist()[3:] == [0, 0]
-        peers[0].copy_(local)
-        peers[1].copy_(local)
-        if mismatch:
-            peers[1][{"capacity": 0, "timeout": 1, "endpoint": 2, "busy": 3, "engine": 4}[mismatch]] += 1
+        assert local.tolist()[3:] == [0, 16 * int(debug)]
+        assert not torch.is_inference(local)
+        with torch.inference_mode(False):
+            peers[0].copy_(local)
+            peers[1].copy_(local)
+            if mismatch:
+                index = {"capacity": 0, "timeout": 1, "endpoint": 2, "busy": 3, "engine": 4, "debug": 4}[mismatch]
+                peers[1][index] += 16 if mismatch == "debug" else 1
 
     monkeypatch.setattr(dist, "all_gather", gather)
     if mismatch:
@@ -271,11 +344,14 @@ def test_bootstrap_without_host_device_checks(monkeypatch, mismatch):
             "endpoint": "bootstrap endpoint",
             "busy": "already owns",
             "engine": "runtime engines",
+            "debug": "debug_collectives",
         }[mismatch]
-        with pytest.raises((ValueError, RuntimeError), match=message):
-            _runtime.Runtime(object(), 2 << 20)
+        with torch.inference_mode(), pytest.raises((ValueError, RuntimeError), match=message):
+            _runtime.Runtime(object(), 2 << 20, debug_collectives=debug)
         assert not created
     else:
-        runtime = _runtime.Runtime(object(), 2 << 20)
+        with torch.inference_mode():
+            runtime = _runtime.Runtime(object(), 2 << 20, debug_collectives=debug)
         assert len(created) == 1
+        assert runtime.debug_collectives is debug
         runtime.close()

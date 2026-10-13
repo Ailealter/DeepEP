@@ -40,27 +40,47 @@ _PERSISTENT = (
 )
 
 
-def _collective_check(runtime, error, signature):
-    """Propagate local prelaunch failures before any rank enters a device collective."""
-    if runtime.group is None:
+def _collective_check(runtime, error, signature, operation, phase=0):
+    """Validate locally, or exchange fixed-size preflight records in debug mode."""
+    if not runtime.debug_collectives or runtime.group is None:
         if error is not None:
             raise error
         return
     import torch
     import torch.distributed as dist
 
-    values = [int(error is not None), *signature]
+    width = 14
+    if len(signature) > width:
+        error = error or ValueError(f"{operation} preflight signature exceeds {width} fields")
+    signature = [] if error is not None else signature
+    values = [int(error is not None), {"Notify": 0, "Dispatch": 1, "Combine": 2}[operation], phase, len(signature)]
+    values += [*signature, *([0] * (width - len(signature)))]
     device = f"npu:{runtime.device}" if str(dist.get_backend(runtime.group)) == "hccl" else "cpu"
     with torch.inference_mode(False), torch.no_grad():
         local = torch.tensor(values, dtype=torch.int64, device=device)
         peers = torch.empty((runtime.world_size, len(values)), dtype=local.dtype, device=local.device)
     dist.all_gather(list(peers.unbind(0)), local, group=runtime.group)
     gathered = peers.cpu().tolist()
+    if any(row[1:3] != gathered[0][1:3] for row in gathered):
+        raise ValueError(f"{operation} preflight: ranks disagree on operation or call order")
     failed = [rank for rank, row in enumerate(gathered) if row[0]]
     if failed:
-        raise ValueError(f"Notify preflight failed on ranks {failed}: {error or 'see the failing rank log'}")
-    if any(row[1:] != gathered[0][1:] for row in gathered):
-        raise ValueError("Notify ranks disagree on T/K/E/hidden or configured token capacity")
+        raise ValueError(f"{operation} preflight failed on ranks {failed}: {error or 'see the failing rank log'}")
+    if any(row[3:] != gathered[0][3:] for row in gathered):
+        raise ValueError(f"{operation} ranks disagree on call parameters or configured capacity")
+
+
+def _payload_empty(shape, *, dtype, device):
+    import torch
+
+    # PTA page_size:1g applies to the large pool. Preserve normal tensor
+    # stream/lifetime ownership while keeping payloads out of the small pool.
+    count = 1
+    for size in shape:
+        count *= size
+    itemsize = torch.empty(0, dtype=dtype).element_size()
+    storage = torch.empty(max(count, (2 << 20) // itemsize), dtype=dtype, device=device)
+    return storage[:count].view(shape)
 
 
 class EPHandle:
@@ -167,6 +187,8 @@ class ElasticBuffer:
         world_size: Optional[int] = None,
         bootstrap: str = "default",
         combine_only: bool = False,
+        use_1g_huge_pages: bool = True,
+        debug_collectives: bool = False,
     ):
         """Initialize MTE+URMA using a group or explicit rank/world_size.
 
@@ -176,7 +198,10 @@ class ElasticBuffer:
         Dispatch and LL require combine_only=False. SDKs with peer-mask support
         use sparse channels; DEEPEP_SHMEM_DENSE_QPS=1 forces dense admission.
         All ranks must agree on configuration and collective call order.
+        debug_collectives=True requires a group and enables HT preflight collectives.
+        Otherwise HT checks parameters locally; the caller handles job-wide failure.
         num_bytes is the entire symmetric workspace, cleared at construction.
+        The workspace uses 1 GiB pages by default; allocation failure does not fall back to smaller pages.
         Dispatch validates exactly 8 GiB when selecting LL; no extra allocation.
         """
         require_native("ElasticBuffer.__init__")
@@ -220,6 +245,8 @@ class ElasticBuffer:
             world_size=world_size,
             bootstrap=bootstrap,
             combine_only=combine_only,
+            use_1g_huge_pages=use_1g_huge_pages,
+            debug_collectives=debug_collectives,
         )
 
     def __del__(self):
@@ -634,6 +661,14 @@ class ElasticBuffer:
         fresh/cached expanded routing with expert_alignment=1, num_qps=0/2,
         and num_compute_units=0/32 for BF16 or 0/64 for FP8. These hints do
         not change the peer-table rear-core schedule.
+        HT does not insert collective entry/exit barrier kernels. Its returned
+        event follows incoming completion checks and local output stores;
+        consumers on another stream must wait on it. Ranks must invoke calls
+        in the same order. Fresh control storage still requires collective
+        initialization before its first use.
+        Fresh HT dispatch requires do_cpu_sync=None/True to read receive counts.
+        Cached HT dispatch also accepts False and reuses the handle's counts;
+        control-layout changes may still require native host synchronization.
         LL returns no expanded weights: its combine applies the saved weights
         internally, so expert output must not be preweighted. With CPU sync
         and an existing EP group LL returns exact R rows; otherwise it returns
@@ -690,7 +725,7 @@ class ElasticBuffer:
                         x, topk_idx, topk_weights, num_experts, capacity, do_handle_copy, do_cpu_sync, plan
                     )
         with runtime.notify_lock:
-            error, signature = None, [0] * 8
+            error, signature = None, []
             try:
                 if runtime.notify_failed:
                     raise RuntimeError("A previous communication launch failed; restart the distributed job")
@@ -705,8 +740,10 @@ class ElasticBuffer:
                         raise TypeError(f"{name} must be bool")
                 if do_expand is not None and do_expand is not True:
                     raise NotImplementedError("Dispatch supports only the expanded expert layout")
-                if do_cpu_sync is not None and do_cpu_sync is not True:
-                    raise NotImplementedError("Dispatch preflight requires do_cpu_sync=None/True")
+                if do_cpu_sync is not None and type(do_cpu_sync) is not bool:
+                    raise TypeError("do_cpu_sync must be bool or None")
+                if handle is None and do_cpu_sync is False:
+                    raise NotImplementedError("Fresh notify requires do_cpu_sync=None/True")
                 if expert_alignment is not None and (type(expert_alignment) is not int or expert_alignment != 1):
                     raise NotImplementedError("Dispatch supports expert_alignment=1")
                 if (
@@ -803,7 +840,7 @@ class ElasticBuffer:
                 ]
             except Exception as exc:
                 error = exc
-            _collective_check(runtime, error, signature)
+            _collective_check(runtime, error, signature, "Dispatch")
 
             if handle is None:
                 _, _, _, handle, _ = self._notify(
@@ -814,7 +851,7 @@ class ElasticBuffer:
                     num_experts,
                     num_max_tokens_per_rank,
                     1,
-                    32,
+                    0,
                     0,
                     previous_event,
                     None,
@@ -859,14 +896,14 @@ class ElasticBuffer:
                             encoded = flat // rows * layout["address_stride"] + flat % rows
                             encoded = torch.where(raw < 0, ~encoded, encoded)
                             handle.dispatch_dst = torch.where(raw == -(1 << 63), raw, encoded)
-                    out = torch.empty((local_rows, width), dtype=hidden.dtype, device=hidden.device)
+                    out = _payload_empty((local_rows, width), dtype=hidden.dtype, device=hidden.device)
                     out_weights = (
                         torch.empty((local_rows,), dtype=torch.float32, device=hidden.device)
                         if topk_weights is not None
                         else None
                     )
                     out_scales = (
-                        torch.empty((local_rows, width // 128), dtype=torch.float32, device=hidden.device)
+                        _payload_empty((local_rows, width // 128), dtype=torch.float32, device=hidden.device)
                         if fp8
                         else None
                     )
@@ -875,6 +912,7 @@ class ElasticBuffer:
                         raise ValueError("Dispatch requires the peer table generated by Notify; recreate the handle")
                     tensors = dict(
                         plan=peer_plan,
+                        dedup_group_size=1 if getattr(handle, "_rank_return_plan", False) else 8,
                         input=hidden,
                         output=out,
                         dst=handle.dispatch_dst,
@@ -889,6 +927,7 @@ class ElasticBuffer:
                     # profile buffers or create device timing events.
                     diagnostics = getattr(self, "_dispatch_diagnostics", None)
                     if diagnostics is not None:
+                        tensors["benchmark_barriers"] = diagnostics.get("benchmark_barriers", False)
                         tensors["profile"] = diagnostics.get("profile")
                         tensors["weight_profile"] = diagnostics.get("weight_profile")
                         tensors["rotation_wqes"] = diagnostics.get("rotation_wqes", 4)
@@ -909,12 +948,12 @@ class ElasticBuffer:
                             *(("_peer_plan",) if peer_plan is not None else ()),
                         )
                     }
-                    # Validate fresh metadata before collective preflight; native dispatch drains cached calls.
-                    if not handle._routing_versions:
+                    # Debug preflight also propagates asynchronous preparation errors.
+                    if runtime.debug_collectives and not handle._routing_versions:
                         runtime.stream.synchronize()
             except Exception as exc:
                 error = exc
-            _collective_check(runtime, error, payload_signature)
+            _collective_check(runtime, error, payload_signature, "Dispatch", phase=1)
             runtime.notify_inflight = retained
             try:
                 with npu.stream(runtime.stream):
@@ -987,7 +1026,7 @@ class ElasticBuffer:
         runtime.ensure_alive()
         native, npu = require_native("ElasticBuffer.combine"), npu_api()
         with runtime.notify_lock:
-            error, signature, retained = None, [0] * 9, ()
+            error, signature, retained = None, [], ()
             try:
                 if runtime.notify_failed:
                     raise RuntimeError("A previous communication launch failed; restart the distributed job")
@@ -1088,6 +1127,11 @@ class ElasticBuffer:
                         "topk_weights must be contiguous FP32 [num_expanded_tokens] on the buffer NPU without grad"
                     )
                 rows, gathered = handle.address_stride, handle._gather_stride
+                ep8_mte = runtime.world_size == 8 and getattr(handle, "_rank_return_plan", False)
+                if ep8_mte:
+                    required_version = 2 if topk_weights is not None else 1
+                    if getattr(native, "combine_ep8_mte_version", lambda: 0)() < required_version:
+                        raise RuntimeError(f"Rebuild/install all ranks for EP8 rank MTE v{required_version}")
                 layout_key = (runtime.world_size, tokens, topk, rows, gathered, chunk, handle.hidden)
                 cached = handle._combine_layout_cache
                 if cached is None or cached[0] != layout_key:
@@ -1098,8 +1142,27 @@ class ElasticBuffer:
                     handle._combine_layout_cache = (layout_key, layout)
                 else:
                     layout = cached[1]
-                if layout["workspace_bytes"] > runtime.capacity // 2:
-                    raise ValueError("Combine exceeds its reserved SHMEM half; increase num_bytes on every rank")
+                reuse_tokens = 0
+                forced_reuse = getattr(self, "_combine_reuse_tokens", 0)
+                combine_capacity = getattr(self, "_combine_capacity_limit", runtime.capacity // 2)
+                integer("Combine capacity", combine_capacity, 1, runtime.capacity // 2)
+                if forced_reuse or layout["workspace_bytes"] > combine_capacity:
+                    from ._combine_reuse import select_window
+
+                    if getattr(handle, "_rank_return_plan", False):
+                        raise ValueError("Combine workspace reuse requires a server-deduplicated handle")
+                    if getattr(native, "combine_reuse_version", lambda: 0)() != 1:
+                        raise RuntimeError("Rebuild/install all ranks for Combine workspace reuse")
+                    reuse_tokens, layout = select_window(layout_key, combine_capacity, forced_reuse)
+                    if profile is not None or getattr(self, "_combine_stage_input", False):
+                        raise ValueError("Combine reuse cannot use staging or legacy diagnostics")
+                stage_input = bool(getattr(self, "_combine_stage_input", False))
+                if stage_input:
+                    if getattr(native, "combine_input_staging_version", lambda: 0)() != 1:
+                        raise RuntimeError("Rebuild/install all ranks for Combine input staging")
+                    staging_end = (layout["workspace_bytes"] + 511) // 512 * 512 + rows * handle.hidden * 2
+                    if staging_end > runtime.capacity // 2:
+                        raise ValueError("Combine input staging exceeds its reserved SHMEM half")
                 if previous_event is not None:
                     previous_event.current_stream_wait()
                 producer = EventHandle()
@@ -1119,6 +1182,17 @@ class ElasticBuffer:
                         )
                     }
                     tensors.update(input=x, output=output)
+                    if reuse_tokens:
+                        from ._combine_reuse import build_plan
+
+                        reuse_backward, reuse_offsets = build_plan(handle, reuse_tokens)
+                        tensors.update(
+                            reuse_tokens=reuse_tokens, reuse_backward=reuse_backward, reuse_offsets=reuse_offsets
+                        )
+                    if stage_input:
+                        tensors["stage_input"] = True
+                    if ep8_mte:
+                        tensors["ep8_rank_mte"] = True
                     output_weights = None
                     if topk_weights is not None:
                         output_weights = torch.empty((tokens, topk), dtype=torch.float32, device=x.device)
@@ -1128,6 +1202,8 @@ class ElasticBuffer:
                             weight_return_meta=handle.weight_return_meta,
                         )
                     retained = (x, output, handle.topk_idx, *(getattr(handle, name) for name in _PERSISTENT))
+                    if reuse_tokens:
+                        retained += (reuse_backward, reuse_offsets)
                     if profile is not None:
                         tensors.update(
                             profile=profile,
@@ -1151,9 +1227,13 @@ class ElasticBuffer:
                     handle.hidden,
                 ]
                 signature += [int(profile is not None), profile_sample]
+                signature += [int(ep8_mte)]
+                signature += [int(stage_input)]
+                signature += [reuse_tokens, combine_capacity]
             except Exception as exc:
                 error = exc
-            _collective_check(runtime, error, signature)
+            _collective_check(runtime, error, signature, "Combine")
+            self._combine_last_reuse_tokens = reuse_tokens
             runtime.notify_inflight = retained
             try:
                 with npu.stream(runtime.stream):
@@ -1199,6 +1279,7 @@ class ElasticBuffer:
         zero_padding,
         aligned_sf,
         chunk_tokens=256,
+        rank_dedup=None,
     ):
         import torch
         from ..utils.event import EventHandle, EventOverlap
@@ -1208,11 +1289,17 @@ class ElasticBuffer:
         native = require_native("ElasticBuffer.dispatch")
         npu = npu_api()
         with runtime.notify_lock:
-            signature = [0] * 6
+            signature = []
             error = None
             try:
                 if runtime.notify_failed:
                     raise RuntimeError("A previous notify launch failed; recreate the distributed job")
+                if rank_dedup is None:
+                    rank_dedup = getattr(self, "_notify_rank_dedup", runtime.world_size in (8, 16))
+                if type(rank_dedup) is not bool:
+                    raise TypeError("rank_dedup must be bool")
+                if rank_dedup and not runtime.combine_only and runtime.world_size not in (8, 16):
+                    raise ValueError("Rank-deduplicated Dispatch supports EP8/16")
                 for name, value in (
                     ("async_with_compute_stream", async_with_compute),
                     ("allocate_on_comm_stream", allocate_on_comm),
@@ -1230,8 +1317,9 @@ class ElasticBuffer:
                     raise NotImplementedError("Fresh notify requires do_cpu_sync=None/True")
                 if alignment is not None and (type(alignment) is not int or alignment != 1):
                     raise NotImplementedError("Notify supports expert_alignment=1")
-                if type(cores) is not int or cores not in (0, 32) or type(qps) is not int or qps != 0:
-                    raise ValueError("Notify uses 32 AIVs and MTE; num_compute_units=0/32, num_qps=0")
+                if type(cores) is not int or cores not in (0, 32, 64) or type(qps) is not int or qps != 0:
+                    raise ValueError("Notify supports 32/64 AIVs and MTE; num_compute_units=0/32/64, num_qps=0")
+                notify_cores = cores or 64
                 if allocate_on_comm or zero_padding or aligned_sf or stats is not None or previous_epilogue is not None:
                     raise NotImplementedError(
                         "Padding, stats, epilogue events and allocation options are not implemented"
@@ -1295,16 +1383,17 @@ class ElasticBuffer:
                     num_experts,
                     chunk_tokens,
                     combine_only=runtime.combine_only,
+                    num_cores=notify_cores,
                 )
                 if specification["workspace_bytes"] != layout["workspace_bytes"]:
                     raise RuntimeError("Python/native notify layouts differ; rebuild the installed package")
                 native.notify_check_mapping(runtime.native)
-                signature = [tokens, topk, num_experts, hidden, capacity, chunk_tokens]
+                signature = [tokens, topk, num_experts, hidden, capacity, chunk_tokens, notify_cores, int(rank_dedup)]
             except Exception as exc:
                 error = exc
-            _collective_check(runtime, error, signature)
+            _collective_check(runtime, error, signature, "Notify")
 
-            # All allocations and input dependencies succeed globally before launching the collective kernel.
+            # Prepare routing storage and order input copies on the communication stream.
             tensors = {}
             indices = topk_idx
             error = None
@@ -1325,11 +1414,11 @@ class ElasticBuffer:
                     indices.record_stream(runtime.stream)
                     for tensor in tensors.values():
                         tensor.record_stream(runtime.stream)
-                    # Catch allocation/input copy errors before device collectives.
-                    runtime.stream.synchronize()
+                    if runtime.debug_collectives:
+                        runtime.stream.synchronize()
             except Exception as exc:
                 error = exc
-            _collective_check(runtime, error, signature)
+            _collective_check(runtime, error, signature, "Notify", phase=1)
             runtime.notify_inflight = (indices, tensors)
             try:
                 with npu.stream(runtime.stream):
@@ -1345,11 +1434,14 @@ class ElasticBuffer:
                         num_experts,
                         runtime.stream.npu_stream,
                         chunk_tokens,
+                        num_cores=notify_cores,
+                        rank_dedup=rank_dedup,
                     )
                     if routing_diagnostics is not None:
                         routing_diagnostics["notify_device_ms"] = notify_ms
                         routing_diagnostics["prepare_device_ms"] = prepare_ms
                         routing_diagnostics["plan_in_notify"] = not runtime.combine_only
+                        routing_diagnostics["plan_in_notify_kernel"] = True
                     tensors.pop("kernel_timing", None)
                     local_experts = num_experts // runtime.world_size
                     begin = runtime.rank * local_experts
@@ -1370,7 +1462,7 @@ class ElasticBuffer:
                         num_experts,
                         1,
                         capacity,
-                        32,
+                        notify_cores,
                         indices,
                         None,
                         rows[runtime.rank],
@@ -1393,6 +1485,7 @@ class ElasticBuffer:
                     result.num_tokens, result.num_topk = tokens, topk
                     result.hidden = hidden
                     result.chunk_tokens = chunk_tokens
+                    result._rank_return_plan = rank_dedup
                     result._buffer_token = self._handle_token
                     result.trace = None
                     retained = (

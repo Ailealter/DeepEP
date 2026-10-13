@@ -26,6 +26,19 @@ struct aclshmemx_init_attr_t {
 };
 int aclshmemx_init_status();
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t*);
+struct aclshmemx_buffer_optional_attr_t {
+    void* mem_handle = nullptr;
+    const void* fabric_handle = nullptr;
+    uint64_t reserved[6]{};
+};
+struct aclshmemx_buffer_desc_t {
+    void* addr = nullptr;
+    uint64_t size = 0;
+    const aclshmemx_buffer_optional_attr_t* optional_attr = nullptr;
+    uint64_t reserved[5]{};
+};
+int aclshmemx_init_attr_with_buffers(int, aclshmemx_init_attr_t*, const aclshmemx_buffer_desc_t*, size_t);
+void* aclshmemx_get_buffer_ptr(const void*);
 int aclshmem_finalize();
 int aclshmemx_set_qp_num(data_op_engine_type_t, uint32_t);
 int aclshmemx_set_shared_jetty(data_op_engine_type_t, bool);

@@ -16,6 +16,16 @@ constexpr uint32_t kWorkers = 32U, kMaxPeers = 16U, kMaxBuffers = 32U;
 // Larger worlds retain all UB buffers and share tickets after a local wait.
 constexpr uint32_t kCompletionEvents = 4U;
 constexpr uint32_t kErrorBytes = 128U * 4U;
+SCALE_PIPE_INLINE constexpr uint32_t Shards(uint32_t world)
+{
+    // Supported EP sizes divide 32. Split each peer's routes when there are
+    // fewer peers than workers, so both TX and RX use all auxiliary AIVs.
+    return world && world < kWorkers ? kWorkers / world : 1U;
+}
+SCALE_PIPE_INLINE constexpr uint32_t ShardRoutes(uint32_t world, uint32_t routes)
+{
+    return (routes + Shards(world) - 1U) / Shards(world);
+}
 struct Layout {
     uint32_t peers = 0, batch = 0, tile = 0;
     uint32_t aux_routes = 0;  // Reuse scale AIV's idle 16KiB local + 8KiB WQE buffers.

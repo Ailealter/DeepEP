@@ -166,7 +166,9 @@ def summarize(events, origin):
     )
 
 
-def write_trace(path, *, events, rank, world, tokens, origin, sample, chunk_tokens=256):
+def write_trace(
+    path, *, events, rank, world, tokens, origin, sample, chunk_tokens=256, kernel="combine_profile_kernel"
+):
     """Write source data and a ready-to-open Perfetto trace; no clock alignment."""
     if not events:
         raise ValueError("Empty peer trace")
@@ -177,7 +179,7 @@ def write_trace(path, *, events, rank, world, tokens, origin, sample, chunk_toke
         tokens=tokens,
         chunk_tokens=chunk_tokens,
         sample=sample,
-        kernel="combine_profile_kernel",
+        kernel=kernel,
         precision_checked=True,
         ticks_per_us=1000,
         time_origin_tick=origin,

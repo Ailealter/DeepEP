@@ -20,7 +20,8 @@
 namespace py = pybind11;
 namespace deepep {
 namespace {
-ascend_deepep::NotifyTiling tiling(int rank, int world, int tokens, int topk, int experts, int chunk_tokens)
+ascend_deepep::NotifyTiling tiling(int rank, int world, int tokens, int topk, int experts, int chunk_tokens,
+                                   uint32_t num_cores)
 {
     if (world < 2 || world > 512 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
         tokens > 16384 || (chunk_tokens != 256 && chunk_tokens != 512 && chunk_tokens != 1024) || topk < 1 ||
@@ -30,7 +31,10 @@ ascend_deepep::NotifyTiling tiling(int rank, int world, int tokens, int topk, in
             "Notify requires EP2..512 powers of two, T1..16384, K1..16, "
             "E<=1024 divisible by EP, and EP*T*K < 2**31");
     }
-    return ascend_deepep::MakeNotifyTiling(rank, world, tokens, topk, experts, chunk_tokens, 7168, 32);
+    if (num_cores != 32U && num_cores != 64U) {
+        throw std::invalid_argument("Notify requires 32 or 64 AIVs");
+    }
+    return ascend_deepep::MakeNotifyTiling(rank, world, tokens, topk, experts, chunk_tokens, 7168, num_cores);
 }
 using Shape = std::vector<int64_t>;
 using Specs = std::map<std::string, std::pair<Shape, std::string>>;
@@ -80,26 +84,40 @@ uint8_t* tensor_pointer(py::handle tensor, const Shape& shape, const std::string
 
 void bind_notify(py::module_& module)
 {
-    module.def("notify_profile_layout", []() {
-        return py::make_tuple(ascend_deepep::notify_diagnostics::kVersion, ascend_deepep::kNotifyCores,
-                              ascend_deepep::notify_diagnostics::kWords);
-    });
+    module.def(
+        "notify_profile_layout",
+        [](uint32_t num_cores) {
+            if (num_cores != 32U && num_cores != 64U) {
+                throw std::invalid_argument("Notify requires 32 or 64 AIVs");
+            }
+            return py::make_tuple(ascend_deepep::notify_diagnostics::kVersion, num_cores,
+                                  ascend_deepep::notify_diagnostics::kWords);
+        },
+        py::arg("num_cores") = ascend_deepep::kNotifyCores);
     module.def(
         "notify_layout",
-        [](int rank, int world, int tokens, int topk, int experts, int chunk_tokens, bool combine_only) {
-            const auto t = tiling(rank, world, tokens, topk, experts, chunk_tokens);
+        [](int rank, int world, int tokens, int topk, int experts, int chunk_tokens, bool combine_only,
+           uint32_t num_cores) {
+            const auto t = tiling(rank, world, tokens, topk, experts, chunk_tokens, num_cores);
             py::dict result;
             result["workspace_bytes"] = t.workspace_bytes;
             result["tensors"] = py::cast(specs(t, !combine_only));
             return result;
         },
         py::arg("rank"), py::arg("world"), py::arg("tokens"), py::arg("topk"), py::arg("experts"),
-        py::arg("chunk_tokens") = 256, py::arg("combine_only") = false);
+        py::arg("chunk_tokens") = 256, py::arg("combine_only") = false,
+        py::arg("num_cores") = ascend_deepep::kNotifyCores);
     module.def(
         "notify",
         [](Session& session, py::object indices, py::dict outputs, int tokens, int topk, int experts,
-           uintptr_t stream_address, int chunk_tokens) {
-            auto t = tiling(session.rank(), session.world(), tokens, topk, experts, chunk_tokens);
+           uintptr_t stream_address, int chunk_tokens, uint32_t num_cores, py::object rank_dedup) {
+            auto t = tiling(session.rank(), session.world(), tokens, topk, experts, chunk_tokens, num_cores);
+            if (!rank_dedup.is_none()) {
+                if (!py::isinstance<py::bool_>(rank_dedup)) throw py::type_error("rank_dedup must be bool or None");
+                t.rank_dedup = rank_dedup.cast<bool>();
+            }
+            if (t.rank_dedup && !session.combine_only() && t.world != 8U && t.world != 16U)
+                throw std::invalid_argument("Rank-deduplicated Dispatch supports EP8/16");
             auto* workspace = static_cast<uint8_t*>(session.workspace());
             if (t.workspace_bytes > session.capacity() / 2U || stream_address == 0) {
                 throw std::invalid_argument("Notify workspace too small or invalid communication stream");
@@ -109,13 +127,21 @@ void bind_notify(py::module_& module)
                 throw std::runtime_error("Cannot obtain current ACL device");
             }
             auto* input = tensor_pointer(indices, {tokens, topk}, "int64", device);
-            // The immutable Session mode decides both the required tensors and
-            // whether Dispatch's SQ admission/peer plan needs to be constructed.
-            const bool dispatch_plan = !session.combine_only();
+            // Notify-only callers may use the public Combine-compatible layout
+            // on a Dispatch-capable session. Only a supplied private plan
+            // requests Dispatch construction; Combine-only always skips it.
+            const bool dispatch_plan = !session.combine_only() && outputs.contains("_peer_plan");
             std::map<std::string, uint8_t*> ptr;
             for (const auto& entry : specs(t, dispatch_plan)) {
                 ptr[entry.first] =
                     tensor_pointer(outputs[py::str(entry.first)], entry.second.first, entry.second.second, device);
+            }
+            t.expert_totals_output = reinterpret_cast<uint64_t>(ptr.at("expert_totals"));
+            if (dispatch_plan) {
+                const auto p =
+                    ascend_deepep::MakeDispatchTiling(t.rank, t.world, t.tokens, t.topk, t.experts, 1U, true);
+                t.dispatch_plan = {reinterpret_cast<uint64_t>(ptr.at("_peer_plan")), p.plan_phase_bytes,
+                                   p.plan_rows_offset, p.plan_scratch_offset, p.plan_mailbox_offset};
             }
             // Mapping validation happens on every rank before device collectives (Python preflight).
             auto stream = reinterpret_cast<aclrtStream>(stream_address);
@@ -130,7 +156,7 @@ void bind_notify(py::module_& module)
                 sample = uint64_t(id);
             }
             py::gil_scoped_release release;
-            DevicePhaseTiming timing(measure), plan_timing(measure && dispatch_plan);
+            DevicePhaseTiming timing(measure);
             timing.mark(0, stream);
             session.invalidate_dispatch_controls();
             if (profile) {
@@ -150,44 +176,16 @@ void bind_notify(py::module_& module)
                     ptr.at("gather_rows"), ptr.at("weight_return_meta"), reinterpret_cast<uint8_t*>(&t));
             }
             timing.mark(1, stream);
-            notify_dispatch_barrier_kernel_do(stream, t.num_cores);
-            if (dispatch_plan) {
-                // The post-Notify barrier retires count exchange. Its first two
-                // 512B slots can now hold admission status without enlarging the workspace.
-                auto plan_t = ascend_deepep::MakeDispatchTiling(t.rank, t.world, t.tokens, t.topk, t.experts, 1U, true);
-                plan_t.sync = t.count_send;
-                plan_timing.mark(0, stream);
-                const auto plan_bytes = ascend_deepep::DispatchPlanBytes(t.world, t.tokens, t.topk);
-                if (aclrtMemsetAsync(ptr.at("_peer_plan"), plan_bytes, 0, plan_bytes, stream) != 0)
-                    throw std::runtime_error("Cannot initialize Notify peer-table mailbox");
-                plan_timing.mark(1, stream);
-                notify_dispatch_peer_plan_kernel_do(stream, workspace, ptr.at("dst"), ptr.at("forward_list"),
-                                                    ptr.at("forward_counts"), ptr.at("_peer_plan"),
-                                                    reinterpret_cast<uint8_t*>(&plan_t), t.address_stride);
-                plan_timing.mark(2, stream);
-                plan_timing.mark(3, stream);
-            }
+            // Publication, Dispatch directory construction and totals export
+            // finish in Notify itself. No payload/table-processing task follows.
             timing.mark(2, stream);
-            const auto bytes = uint64_t(experts) * sizeof(int32_t);
-            if (aclrtMemcpyAsync(ptr.at("expert_totals"), bytes, workspace + t.expert_totals, bytes,
-                                 ACL_MEMCPY_DEVICE_TO_DEVICE, stream) != 0) {
-                throw std::runtime_error("Cannot preserve notify expert totals");
-            }
             timing.mark(3, stream);
-            if (dispatch_plan) {
-                if (aclrtSynchronizeStream(stream) != 0)
-                    throw std::runtime_error("Notify peer-table preparation failed");
-                uint32_t status = 0;
-                if (aclrtMemcpy(&status, sizeof(status), workspace + t.count_send + 512U, sizeof(status),
-                                ACL_MEMCPY_DEVICE_TO_HOST) != 0)
-                    throw std::runtime_error("Cannot read Notify peer-table admission status");
-                if (status)
-                    throw std::invalid_argument("Notify peer-table admission failed: SQ capacity or invalid plan");
-            }
-            return std::make_pair(timing.finish(stream), plan_timing.finish(stream));
+            // Keep the diagnostic tuple ABI; in-kernel clocks report plan time.
+            return std::make_pair(timing.finish(stream), measure ? std::vector<float>(4, 0.0F) : std::vector<float>{});
         },
         py::arg("session"), py::arg("indices"), py::arg("outputs"), py::arg("tokens"), py::arg("topk"),
-        py::arg("experts"), py::arg("stream_address"), py::arg("chunk_tokens") = 256);
+        py::arg("experts"), py::arg("stream_address"), py::arg("chunk_tokens") = 256,
+        py::arg("num_cores") = ascend_deepep::kNotifyCores, py::arg("rank_dedup") = py::none());
     module.def("notify_check_mapping", [](Session& session) {
         void* workspace = session.workspace();
         for (int peer = 0; peer < session.world(); ++peer) {
