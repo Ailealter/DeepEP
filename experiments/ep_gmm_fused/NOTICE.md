@@ -16,6 +16,12 @@ public operator aliases; shared C++ SHMEM bootstrap; ProcessGroup UID exchange a
 lifecycle checks; independent generalized tests, performance and profiler runners.
 Device computation and UDMA completion protocols are retained from the PR.
 
+The selective performance update from MR 11602 commit
+`3ab6b8bba2cbdaf3751596c3e4b0488e1991df5f` is recorded separately in
+`upstream.json`: inverse physical staging, two/three-buffer templates, parallel
+self copy and both operators' EP4/28-expert defaults. The existing EP8 profiles
+and repository-local correctness checks remain in place.
+
 Third-party code retains its copyright and license notices, including the CatCCOS
 overlay (csrc/catccos_overlay/LICENSE in the source distribution). The wheel
 includes the licenses from the pinned CatCCOS, CATLASS and

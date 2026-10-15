@@ -42,9 +42,18 @@ Repository-local fixes layered after the CatCCOS branch—dynamic output extents
 UDMA completion publication after queue quiet, and guarded workspace-loop
 subtraction—remain applied on top of this delivery update.
 
-The history above does not define the public tiling support matrix. This
-integration instantiates `128x256x256`, `256x128x256` and `256x256x256` for
-AllToAllV-GroupedMatmul, and only `128x256x256` and `256x128x256` for
-GroupedMatmul-AllToAllV. Host parsing and Python search reject all other shapes.
+The physical staging and parallel self-copy updates from ops-transformer MR
+11602 at `3ab6b8bba2cbdaf3751596c3e4b0488e1991df5f` are integrated for
+GroupedMatmul-AllToAllV. Both directions instantiate `128x256x256`,
+`256x128x256` and `256x256x256`; the inverse supports two or three workspace
+stages, explicit stage-row capacity and configurable self-copy workers.
+Each remote peer retains one completion owner. Only the primary self worker
+publishes receive completion; all self workers finish their MTE block loops
+and join the AIV barrier before workspace reuse. Peer-scoped UDMA completion
+and `aclshmemx_mte_quiet()` remain in place.
+Legacy five-field inverse tilings retain derived staging, two workspace stages
+and one self-copy worker. The EP8/256-expert defaults are unchanged; new EP4/
+28-expert profiles are selected by the host for the documented shapes.
+Host parsing and Python search reject all other MMAD shapes.
 Local copy staging uses the pinned CATLASS Ascend950 allocation of 248 KiB,
 including a 256-byte UDMA scratch reservation, rather than physical 256 KiB UB.

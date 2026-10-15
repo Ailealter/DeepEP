@@ -32,6 +32,22 @@ python -m experiments.ep_gmm_fused.tests.run accuracy --suite generalization --e
 python -m pytest tests/runtime/test_ep_gmm_fused_build.py experiments/ep_gmm_fused/tests/test_regressions.py -q
 ```
 
+上述回归也检查 Python 中的 EP8 固定参数、EP4 配置匹配范围、旧五字段兼容和两/三缓冲资源边界；
+已有 C++ 测试直接包含生产校验头文件，检查五/八字段解析与旧配置默认值重置。
+
+重新编译安装后，用独立 manifest 验证新增路径，不改变既有 smoke/model/generalization 集合：
+
+```bash
+python -m experiments.ep_gmm_fused.tests.run accuracy --cases experiments/ep_gmm_fused/tests/scheduling_cases.json --dry-run
+python -m experiments.ep_gmm_fused.tests.run accuracy --cases experiments/ep_gmm_fused/tests/scheduling_cases.json --timeout 1800
+python -m experiments.ep_gmm_fused.tests.run accuracy --suite smoke
+```
+
+该 manifest 包含 16 项：4 个 EP4 默认配置的均衡/随机路由、逆向 3 种 MMAD × 2 种缓冲级数的
+多轮复用，以及仅本地/仅远端的 3 行尾块（少于 8 个 self-copy worker）。
+CPU 检查不能验证设备数据可见性；多核拷贝完成与 workspace 复用须由上述 Ascend950 精度用例验收。
+原有固定 case 的性能回归继续使用 `bench --suite smoke --ep-size 8`，比较同一部署环境和采集口径。
+
 UB 的 Python 检查和真实 wheel 切换检查不依赖 Torch；Host C++ 检查需要 C++17 编译器，
 内存重叠与 Meta/FakeTensor 检查需要 Linux、CPU 可用的 Torch、C++ 编译器和 Ninja。
 缺少依赖时相应测试会 skip，不代表这些检查已通过。

@@ -169,6 +169,31 @@ destroy_udma_group()
 - 两算子均支持 `out=`；正向导出还支持 `all_to_allv_out=`。异步结果需按 NPU stream 规则消费。
 - 所有 rank 必须使用一致的形状配置、路由对应关系及 tiling；本库不是 autograd 封装。
 
+## Tiling 兼容与 EP4 配置
+
+已同步 MR 11602 提交 `3ab6b8bba2cbdaf3751596c3e4b0488e1991df5f` 的逆向调度扩展与 EP4 默认配置。
+两方向均支持 `128×256×256`、`256×128×256`、`256×256×256` MMAD 分块。
+`gmm_alltoallv` 的 `tiling=` 新增 `stage_rows`、`workspace_stages`、`self_copy_cores`：
+分别指定每 rank 每缓冲的 staging 行容量、2/3 级缓冲及本地拷贝 worker 数。
+`stage_rows=0` 时继续由核数、`comm_interval`、EP 和 N 推导容量。
+旧五字段配置仍有效，新增字段默认 `0/2/1`，不会继承新 shape 的三缓冲或并行拷贝设置。
+使用扩展字段须重新编译安装 wheel；原有 248 KiB UB、对齐工作区、内存重叠和动态输出检查继续生效。
+
+EP8、总专家数 256 的已有固定配置保持不变，包括逆向 `K=1024/512、N=2048` 的
+`128×256×256` 分块、通信间隔 `10/16`、本地拷贝行数 `4/16`、双缓冲及单 self-copy worker。
+
+EP4、总专家数 28（每卡 7 专家）新增以下自动选择的配置；显式 `tiling=` 可覆盖：
+
+| 算子 | 形状条件 | MMAD | staging 行数 | 缓冲级数 | 本地拷贝行数 | self-copy worker | export worker |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `alltoallv_gmm`，export 开启 | M=131072、K=3584、N=6144 | 256×256×256 | 2048 | 2 | 16 | 4 | 8 |
+| `alltoallv_gmm`，export 开启 | M=131072、K=3584、N=3072 | 256×256×256 | 2048 | 2 | 16 | 8 | 8 |
+| `gmm_alltoallv` | K=3072、N=3584 | 256×256×256 | 2048 | 3 | 8 | 8 | — |
+| `gmm_alltoallv` | K=6144、N=3584 | 256×256×256 | 2048 | 2 | 8 | 8 | — |
+
+正向非 export 调用及不匹配上述条件的形状继续使用原选择逻辑。逆向不以 rank 本地 M 为匹配条件，
+因此不均衡路由下各 rank 仍选择同一配置。新增调度的实机验证入口见[测试说明](tests/README.md)。
+
 ## API 名称与别名
 
 | 功能 | 主 API | 长名称别名 |
