@@ -4,7 +4,6 @@
 #include "shmem.h"
 #include "simt_api/device_functions.h"
 #include "tiling.hpp"
-#include "core_plan.hpp"
 #include "launch.hpp"
 #include "profile.hpp"
 #include "chunk_profile.hpp"
@@ -53,6 +52,24 @@ namespace diagnostics = ascend_deepep::combine_diagnostics;
 namespace chunks = ascend_deepep::combine_chunks;
 namespace peers = ascend_deepep::combine_peers;
 #if (defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)) && CATLASS_ARCH == 3510
+// Physical cores are compact; completion slots keep the peer/lane ABI.
+struct Ep8Owner {
+    uint32_t peer, lane;
+};
+__aicore__ inline constexpr uint32_t Ep8SourceBegin(uint32_t cores, bool final_window)
+{
+    return final_window ? 11U : cores / 2U;
+}
+__aicore__ inline constexpr uint32_t Ep8FirstSourceToken(uint32_t begin, uint32_t core, uint32_t source_begin,
+                                                         uint32_t stride)
+{
+    return begin + (core - source_begin + stride - begin % stride) % stride;
+}
+__aicore__ inline constexpr Ep8Owner Ep8ReturnOwner(uint32_t rank, uint32_t core)
+{
+    if (core < 7U) return {core < rank ? core : core + 1U, 0U};
+    return {rank, core - 7U};
+}
 template <bool Enabled>
 struct Profile {
     TBuf<QuePosition::VECCALC> buffer, chunk_buffer, peer_buffer;
@@ -1573,10 +1590,9 @@ __aicore__ inline void WaitSourceChunk(GM_ADDR workspace, const CombineTiling& t
             record.SetValue(peers::FlagsReady, flags_ready);
             record.SetValue(peers::SyncEnd, sync_end);
             // Keep one diagnostic GM writer per peer.
-            if (!ep8_pipeline ||
-                record.GetValue(peers::Peer) +
-                        ascend_deepep::Ep8SourceBegin(GetBlockNum(), window_end + 1U == tiling.chunks_per_group) ==
-                    core_id)
+            if (!ep8_pipeline || record.GetValue(peers::Peer) +
+                                         Ep8SourceBegin(GetBlockNum(), window_end + 1U == tiling.chunks_per_group) ==
+                                     core_id)
                 profile.PeerSave(record);
         }
         profile.Elapsed(diagnostics::PeerExportTicks, sync_end);
@@ -2523,8 +2539,8 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
 #ifdef DEEPEP_COMBINE_EP8_MTE
         // Weighted EP8 retains the upstream four MTE copy lanes per peer.
         // Only unweighted EP8 sends through UDMA, with one QP0 owner per peer.
-        const auto return_owner = UseEp8ReturnPipeline(tiling) ? ascend_deepep::Ep8ReturnOwner(tiling.rank_id, core_id)
-                                                               : ascend_deepep::Ep8Owner{core_id / 4U, core_id % 4U};
+        const auto return_owner = UseEp8ReturnPipeline(tiling) ? Ep8ReturnOwner(tiling.rank_id, core_id)
+                                                               : Ep8Owner{core_id / 4U, core_id % 4U};
         const uint32_t peer_rank = return_owner.peer, mte_lane = return_owner.lane;
         const uint32_t return_slot_core = peer_rank * 4U + mte_lane;
         if (UseEp8ReturnPipeline(tiling) && peer_rank != tiling.rank_id) ValidateEp8PeerQp(tiling, peer_rank);
@@ -2684,12 +2700,11 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
          window_begin = SoWindowEnd(tiling, window_begin) + 1U) {
         const uint32_t window_end = SoWindowEnd(tiling, window_begin);
         const uint32_t source_begin =
-            ep8_pipeline ? ascend_deepep::Ep8SourceBegin(GetBlockNum(), window_end + 1U == tiling.chunks_per_group)
-                         : 0U;
+            ep8_pipeline ? Ep8SourceBegin(GetBlockNum(), window_end + 1U == tiling.chunks_per_group) : 0U;
         if (core_id < source_begin) continue;
         const uint32_t source_stride = GetBlockNum() - source_begin;
         const uint32_t phase_token_begin = window_begin == 0U ? 0U : ChunkTokenEnd(tiling, window_begin - 1U);
-        uint32_t token_id = ascend_deepep::Ep8FirstSourceToken(phase_token_begin, core_id, source_begin, source_stride);
+        uint32_t token_id = Ep8FirstSourceToken(phase_token_begin, core_id, source_begin, source_stride);
         if (previous_source_stride != source_stride) {
             // Prefetched masks use the previous token stride and must not cross a pool change.
             mask_batch_count = mask_batch_index = 0U;
