@@ -35,7 +35,8 @@ python -m pytest tests/runtime/test_ep_gmm_fused_build.py experiments/ep_gmm_fus
 上述回归也检查 Python 中的 EP8 固定参数、EP4 配置匹配范围、旧五字段兼容和两/三缓冲资源边界；
 已有 C++ 测试直接包含生产校验头文件，检查五/八字段解析与旧配置默认值重置。
 
-重新编译安装后，用独立 manifest 验证新增路径，不改变既有 smoke/model/generalization 集合：
+smoke 已包含 4 个新增 EP4 固定形状的均衡用例，两个 `alltoallv_gmm` 均导出 AllToAllV 输出。
+重新编译安装后，可用独立 manifest 验证完整调度覆盖：
 
 ```bash
 python -m experiments.ep_gmm_fused.tests.run accuracy --cases experiments/ep_gmm_fused/tests/scheduling_cases.json --dry-run
@@ -44,7 +45,7 @@ python -m experiments.ep_gmm_fused.tests.run accuracy --suite smoke
 ```
 
 该 manifest 包含 16 项：4 个 EP4 默认配置的均衡/随机路由、逆向 3 种 MMAD × 2 种缓冲级数的
-多轮复用，以及仅本地/仅远端的 3 行尾块（少于 8 个 self-copy worker）。
+多轮复用，以及仅本地/仅远端的 3 行尾块（少于 8 个 self-copy worker）。其中 4 个均衡用例与 smoke 相同。
 CPU 检查不能验证设备数据可见性；多核拷贝完成与 workspace 复用须由上述 Ascend950 精度用例验收。
 原有固定 case 的性能回归继续使用 `bench --suite smoke --ep-size 8`，比较同一部署环境和采集口径。
 
@@ -62,10 +63,10 @@ EP4/EP8 模型形状及固定版本的官方 config 来源保存在 [模型配�
 
 | suite | 数量（默认 seed） | 内容 |
 | --- | ---: | --- |
-| smoke | 12 | 原小规模 6 个与原 PR 回归 6 个 |
+| smoke | 16 | 原小规模 6 个、EP8 固定回归 6 个与新增 EP4 固定回归 4 个 |
 | model | 504 | 12 个模型/EP 组合 × 3 投影 × 7 个 M 档位 × 2 种路由 |
 | generalization | 1060 | 505 个基础用例及 555 个定向用例 |
-| all | 1576 | 以上三层，无重复 ID |
+| all | 1580 | 以上三层，无重复 ID |
 
 `nightly` 仅保留旧入口兼容，不属于新的三层统计；包含旧的 >32 专家用例。
 模型常规 M 目标为 4096/8192/16384/32768/65536/131072/262144，按 TopK 向上取整；
@@ -176,11 +177,12 @@ composition 的两次 matmul 也使用 NPU FP32，只在两次公开调用之间
 二者部分重叠，不能直接相加。`dut_call_and_sync_seconds` 记录 DUT 调用与同步，
 queued 序列延后检查时不能据此推算提交时延；端到端耗时应测量整个 runner。
 这些用例不覆盖标准全文的全部组合与特殊值要求，也不承诺未实测的 NPU 参考耗时。
-`--suite smoke` 共 12 个 case：原有 6 个小规模 case 保持不变，加上原 PR 的 6 个业务回归。
-这 6 个回归统一为 M=131072、EP8、每卡 32 专家、预分配输出，仅归入 smoke，
-不提供独立 business suite，也不加入 nightly。完整 smoke 需要 8 卡；
-需充足主机内存并按机器算力设置 `--timeout`，可通过 `--ep-size 1/2` 筛选原有小规模用例。
-case ID 根据当前用例的完整配置生成；默认 seed=20260920 时，这 6 个回归的标识如下：
+`--suite smoke` 共 16 个均衡路由 case：原有 6 个小规模用例、6 个 EP8 固定回归和 4 个新增 EP4 固定回归。
+10 个固定回归统一为 M=131072、预分配输出；EP8 每卡 32 专家，EP4 每卡 7 专家。
+新增 EP4 正向用例均为 `export=True`，4 项均使用默认调度。固定回归不加入 nightly。
+完整 smoke 需要 8 卡；需充足主机内存并按机器算力设置 `--timeout`。
+可通过 `--ep-size 4` 筛选新增用例，`--ep-size 8` 筛选原固定回归，`--ep-size 1/2` 筛选原小规模用例。
+case ID 根据完整配置生成；默认 seed=20260920 时，原 6 个 EP8 回归的标识如下：
 
 | 来源：原 PR 11602 | K→N | export | case ID |
 | --- | --- | --- | --- |
@@ -190,6 +192,15 @@ case ID 根据当前用例的完整配置生成；默认 seed=20260920 时，这
 | alltoallv_gmm | 2048→1024 | true | `158f953cce43d23f` |
 | gmm_alltoallv | 512→2048 | false | `84dbe9c348d7b2d6` |
 | gmm_alltoallv | 1024→2048 | false | `15563514d1bcadd6` |
+
+新增 4 个 EP4 固定回归如下（均衡路由，默认 seed=20260920）：
+
+| 算子 | K→N | export | case ID |
+| --- | --- | --- | --- |
+| alltoallv_gmm | 3584→3072 | true | `18033d3443952e5e` |
+| alltoallv_gmm | 3584→6144 | true | `dd2cc891e3a1eade` |
+| gmm_alltoallv | 3072→3584 | false | `a5a9bae68cd35dfa` |
+| gmm_alltoallv | 6144→3584 | false | `40cfbabfd445b46c` |
 
 ## 性能
 
