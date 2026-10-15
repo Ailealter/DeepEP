@@ -6,6 +6,7 @@ import html
 import json
 from pathlib import Path
 
+EP8_SINGLE_QP_FLAG = 0x45505131
 VERSION, MAGIC, WORDS, TICKS_PER_US = 2, 0x43484B50, 36, 1000
 FIELDS = (
     "Magic Version Sample KindId Core Group Chunk Peer Begin WaitBegin Ready WorkBegin WorkEnd End Tokens Rows "
@@ -58,6 +59,22 @@ def decode(records, *, rank, world, tokens, sample, chunk_tokens=256, ep8_rank_m
     chunks = expected[1] // (groups + 2)
     if len(records) != 64 or any(len(core) != expected[1] for core in records):
         raise ValueError("Invalid chunk tensor shape")
+    compact = ep8_rank_mte and any(
+        len(row) == WORDS and row[3] == 4 and row[30] == EP8_SINGLE_QP_FLAG for row in records[0]
+    )
+    window_pool = {}
+    if compact:
+        local = 11
+        # Core 63 participates in every window. Require the final schedule,
+        # rather than accepting experimental fixed-width or 32-AIV policies.
+        for row in records[63]:
+            if len(row) == WORDS and row[:3] == [MAGIC, VERSION, sample] and row[3] == 5:
+                begin = 11 if row[29] == chunks - 1 else 32
+                if row[30] != 0x45600000 | (64 << 8) | (64 - begin):
+                    raise ValueError("Invalid window source-pool marker")
+                window_pool[row[6]] = begin
+        if set(window_pool) != set(range(chunks)):
+            raise ValueError("Missing window source-pool plan")
     events = []
     final_seen, gateway_seen, cross_seen, local_seen = set(), set(), set(), set()
     for core, rows in enumerate(records):
@@ -90,6 +107,10 @@ def decode(records, *, rank, world, tokens, sample, chunk_tokens=256, ep8_rank_m
                 if v[a] and (not v[b] or v[b] < v[a]):
                     raise ValueError(f"Invalid chunk interval {a}/{b}")
             if kind == 5:
+                if compact and (
+                    core < window_pool[chunk] or v["Flags"] != 0x45600000 | (64 << 8) | (64 - window_pool[chunk])
+                ):
+                    raise ValueError("Invalid EP8 source-pool owner/marker")
                 if group != 0 or not chunk <= v["WindowEnd"] < chunks:
                     raise ValueError("Invalid final-reduce window")
                 final_seen.add((core, chunk))
@@ -116,8 +137,16 @@ def decode(records, *, rank, world, tokens, sample, chunk_tokens=256, ep8_rank_m
                     raise ValueError("Unexpected final group barrier")
                 cross_seen.add((core, group, chunk))
             elif kind == 4:
+                if compact and v["Flags"] != EP8_SINGLE_QP_FLAG:
+                    raise ValueError("Invalid EP8 return marker")
                 local_seen.add((core, chunk))
-            peer = core // 4 if ep8_rank_mte else rank // 8 * 8 + core
+            peer = (
+                ((core if core < rank else core + 1) if core < 7 else rank)
+                if compact
+                else core // 4
+                if ep8_rank_mte
+                else rank // 8 * 8 + core
+            )
             if ep8_rank_mte and kind == 1:
                 raise ValueError("EP8 rank MTE has no gather tasks")
             if kind in (1, 4) and (core >= local or v["Peer"] != peer):
@@ -150,7 +179,7 @@ def decode(records, *, rank, world, tokens, sample, chunk_tokens=256, ep8_rank_m
                     window_end=v["WindowEnd"],
                 )
             )
-    if final_seen != {(c, k) for c in range(64) for k in range(chunks)}:
+    if final_seen != {(c, k) for k in range(chunks) for c in range(window_pool[k] if compact else 0, 64)}:
         raise ValueError("Missing final-reduce chunk records")
     if gateway_seen != {(c, g, k) for c in range(gateway_begin, 64) for g in range(groups) for k in range(chunks)}:
         raise ValueError("Missing gateway chunk records")

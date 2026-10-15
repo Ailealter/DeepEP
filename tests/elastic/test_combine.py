@@ -4150,3 +4150,116 @@ def test_peer_cpp_python_record_abi():
 
 if __name__ == "__main__":
     main()
+
+
+def test_ep8_source_window_token_ownership(tmp_path):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("C++17 compiler unavailable")
+    source = tmp_path / "window.cpp"
+    source.write_text(
+        """#include <cassert>
+#include <initializer_list>
+#include "core_plan.hpp"
+int main() {
+    using namespace ascend_deepep;
+    for (unsigned rank=0; rank<8; ++rank) {
+        unsigned peer_count[8]{}, self_lanes=0;
+        for (unsigned core=0; core<11; ++core) {
+            auto owner=Ep8ReturnOwner(rank, core);
+            assert(owner.peer<8);
+            if (owner.peer==rank) {
+                assert(core>=7 && owner.lane==core-7);
+                self_lanes |= 1U<<owner.lane;
+            } else {
+                assert(core<7 && owner.lane==0);
+                ++peer_count[owner.peer];
+            }
+        }
+        assert(self_lanes==15);
+        for (unsigned peer=0; peer<8; ++peer)
+            assert(peer_count[peer]==(peer==rank ? 0U : 1U));
+    }
+    for (unsigned tokens : {1U, 257U, 4096U, 16384U, 16403U}) {
+        unsigned bounds[] = {0U, tokens/2U, tokens*3U/4U, tokens};
+        for (unsigned window=0; window<3; ++window) {
+            unsigned begin = Ep8SourceBegin(CORES, window==2);
+            unsigned stride = CORES-begin;
+            assert(begin == (window==2 ? 11U : CORES/2U));
+            for (unsigned token=bounds[window]; token<bounds[window+1]; ++token) {
+                unsigned owners=0;
+                for (unsigned core=begin; core<CORES; ++core) {
+                    unsigned first=Ep8FirstSourceToken(bounds[window], core, begin, stride);
+                    owners += token>=first && (token-first)%stride==0;
+                }
+                assert(owners==1);
+            }
+        }
+    }
+}
+""".replace("CORES", "64U")
+    )
+    binary = tmp_path / "window"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-I" + str(_chunk_ROOT / "csrc/kernels/combine"),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+    )
+    subprocess.run([str(binary)], check=True)
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_ep8_window_source_pool_requires_every_owner(rank):
+    records, args = _chunk_records(ep8_rank_mte=True)
+    args["rank"] = rank
+    chunks = len(records[0]) // 3
+    ends = _combine_peers["window_ends"](args["tokens"])
+    fields = {name: i for i, name in enumerate(_chunk_chunk["FIELDS"])}
+    result = [[[0] * _chunk_chunk["WORDS"] for _ in records[0]] for _ in range(64)]
+    for core in range(64):
+        for chunk in range(chunks):
+            end = next(e for e in ends if e >= chunk)
+            begin = 32 if end != ends[-1] else 11
+            kinds = ([4] if core < 11 else []) + ([2] if core >= 32 else []) + ([5] if core >= begin else [])
+            for kind in kinds:
+                index = (2 if kind == 5 else 1 if kind == 4 else 0) * chunks + chunk
+                row = records[0 if kind in (4, 5) else 32][index].copy()
+                row[fields["Core"]], row[fields["WindowEnd"]] = core, end
+                row[fields["Flags"]] = (
+                    (0x45600000 | 64 << 8 | (64 - begin))
+                    if kind == 5
+                    else _chunk_chunk["EP8_SINGLE_QP_FLAG"]
+                    if kind == 4
+                    else 0
+                )
+                if kind == 4:
+                    row[fields["Peer"]] = (core if core < rank else core + 1) if core < 7 else rank
+                result[core][index] = row
+    _chunk_chunk["decode"](result, **args, ep8_rank_mte=True)
+    result[62][2 * chunks] = [0] * _chunk_chunk["WORDS"]
+    with pytest.raises(ValueError, match="Missing final-reduce"):
+        _chunk_chunk["decode"](result, **args, ep8_rank_mte=True)
+
+
+def test_ep8_final_summary_keeps_v4_layout():
+    rows = _summary_records(world=8)
+    fields = {name: i for i, name in enumerate(_summary_FIELDS)}
+    for core, row in enumerate(rows):
+        row[fields["WithWeights"]] = 0
+        row[fields["Role"]] = 0 if core < 11 else 2 if core >= 32 else 3
+    decoded = _summary_metrics["decode_profile"](
+        rows, rank=0, world=8, tokens=4096, topk=6, weights=False, sample=1, ep8_rank_mte=True
+    )
+    assert _summary_metrics["VERSION"] == 4 and _summary_metrics["WORDS"] == 72
+    assert [d["role"] for d in decoded] == ["local"] * 11 + ["idle"] * 21 + ["gateway"] * 32
+    rows[12][fields["Role"]] = 0
+    with pytest.raises(ValueError, match="Missing/stale"):
+        _summary_metrics["decode_profile"](
+            rows, rank=0, world=8, tokens=4096, topk=6, weights=False, sample=1, ep8_rank_mte=True
+        )
