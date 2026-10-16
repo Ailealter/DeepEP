@@ -58,7 +58,7 @@ UB 的 Python 检查和真实 wheel 切换检查不依赖 Torch；Host C++ 检�
 
 生成器和 runner 覆盖真实路由分布检查、同一实例动态调用序列与超时、
 零接收/尾块/容量边界，以及合法调度配置扫描。设备执行仍需 Ascend950 验收。
-EP4/EP8 模型形状及固定版本的官方 config 来源保存在 [模型配置](MODEL_CASES.json) 中。
+EP4/EP8 模型形状及固定版本的 config 参数保存在 [模型配置](MODEL_CASES.json) 中。
 两个算子的模型及泛化用例统一选择每卡≤32专家，常规训练规模覆盖单卡展开 M≥262144。
 
 | suite | 数量（默认 seed） | 内容 |
@@ -75,7 +75,7 @@ EP4/EP8 模型形状及固定版本的官方 config 来源保存在 [模型配�
 manifest 保存模型 revision、目标/实际 M、TopK、路由 seed；可确定性重建 token 到排序行的映射。
 
 模型配置仅保留当前使用的 9 个模型、12 个模型/EP 组合及 36 个投影模板，未启用的 >32 专家部署不入表。
-JSON 保留来源 revision、config 链接和原配置校验和；它是生成器的配置注册表，不能直接传给 `--cases`。
+JSON 保留 config revision、链接和配置校验和；它是生成器的配置注册表，不能直接传给 `--cases`。
 所有数据和权重均为 BF16 合成值，无需下载模型权重；数量不代表设备精度、autograd 或完整模型部署已通过。
 
 模型用例假定专家 TP=1、专家按编号连续等分，无 token drop、共享专家或冗余专家，各源 rank 的原始 token 数相同。
@@ -139,10 +139,10 @@ python -m experiments.ep_gmm_fused.tests.run accuracy --suite generalization --c
 `framework/cases.py` 统一用例协议；设备校验使用独立普通 NPU FP32 matmul 生成单一 golden，
 CPU 重建通信排列，输入/权重保留实际 BF16 数值，最终 golden 不舍入为 BF16。
 `reference/golden.py` 保留独立的 CPU FP32 参考辅助，不作为设备验收后端。
-BF16 输出使用 [opbase `81d8b019` 混合容差标准](https://gitcode.com/cann/opbase/blob/81d8b019af1b22a35bcb82a48f28d0f3ab6265ed/docs/zh/ops_precision_standard/mixed_tolerance_standard.md)：
+BF16 输出采用混合容差判据：
 atol=rtol=2^-7，至少 99% 元素通过。
-本工程将原文硬上限 `0.1 or 32*ULP` 实现为每元素 `max(0.1,32*ULP_BF16(golden))`，
-ULP 按未舍入 golden 的数值区间计算；该合并方式是工程解释，记录在报告中。
+每元素硬上限为 `max(0.1,32*ULP_BF16(golden))`，
+ULP 按未舍入 golden 的数值区间计算；判据及阈值记录在报告中。
 统一判据位于 `reference/precision.py`，误差统计使用 FP64 算术，但不做 CPU FP64 GEMM。
 导出逐元素、精确标签检查仍作为门禁；任一 rank 失败则整项失败，L2 仅报告。
 有限输入用例出现 NaN/Inf 即失败；BF16 次正规数的 ULP 使用最小间距。
@@ -176,7 +176,7 @@ composition 的两次 matmul 也使用 NPU FP32，只在两次公开调用之间
 `reference_seconds` 包括 D2H、golden 计算和比较；`generation_seconds` 记录缓存填充时间，
 二者部分重叠，不能直接相加。`dut_call_and_sync_seconds` 记录 DUT 调用与同步，
 queued 序列延后检查时不能据此推算提交时延；端到端耗时应测量整个 runner。
-这些用例不覆盖标准全文的全部组合与特殊值要求，也不承诺未实测的 NPU 参考耗时。
+这些用例只覆盖所列输入组合和特殊值场景，不承诺未实测的 NPU 参考耗时。
 `--suite smoke` 共 16 个均衡路由 case：原有 6 个小规模用例、6 个 EP8 固定回归和 4 个新增 EP4 固定回归。
 10 个固定回归统一为 M=131072、预分配输出；EP8 每卡 32 专家，EP4 每卡 7 专家。
 新增 EP4 正向用例均为 `export=True`，4 项均使用默认调度。固定回归不加入 nightly。
@@ -184,7 +184,7 @@ queued 序列延后检查时不能据此推算提交时延；端到端耗时应�
 可通过 `--ep-size 4` 筛选新增用例，`--ep-size 8` 筛选原固定回归，`--ep-size 1/2` 筛选原小规模用例。
 case ID 根据完整配置生成；默认 seed=20260920 时，原 6 个 EP8 回归的标识如下：
 
-| 来源：原 PR 11602 | K→N | export | case ID |
+| 算子 | K→N | export | case ID |
 | --- | --- | --- | --- |
 | alltoallv_gmm | 2048→512 | false | `64d79f3ff1f3e5e6` |
 | alltoallv_gmm | 2048→512 | true | `e155852c92031034` |
@@ -271,7 +271,7 @@ python -m experiments.ep_gmm_fused.tests.run profile --ep-size 2 --operator allt
 二进制用 MindStudio Insight 查看。`op_summary` 独立使用常规 msprof，duration imbalance
 只报告，不当作 launch skew，也不否决不均衡路由。
 
-参数参考：[官方 msOpProf 指南](https://github.com/Ascend/msopprof/blob/master/docs/zh/user_guide/msopprof_user_guide.md)。
+可用参数以当前环境的 `msopprof --help` 或 `msprof op --help` 输出为准。
 部署版本的 UDMA replay、进程退出和采集文件结构仍需实机验收。
 
 ## 64 卡多个 EP4 域与重放
