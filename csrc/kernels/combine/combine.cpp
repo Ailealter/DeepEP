@@ -1126,12 +1126,13 @@ __aicore__ inline void PublishLocalMteFlag(__gm__ uint64_t* flag, uint32_t peer,
     auto* remote = LocalMteDestination(reinterpret_cast<GM_ADDR>(flag), peer, self);
     StoreFlag(reinterpret_cast<__gm__ uint64_t*>(remote), signal_ub, 1U);
 }
-// The UDMA return pipeline applies to unweighted EP8. Weighted EP8 uses
-// MTE returns and their matching source-consumer schedule.
+// EP8 hidden returns use the same UDMA pipeline with or without weights.
+// Weight stores retain their independent local-done / rank-done completion chain.
 __aicore__ inline bool UseEp8ReturnPipeline(const CombineTiling& tiling)
 {
 #ifdef DEEPEP_COMBINE_EP8_MTE
-    return !tiling.with_weights;
+    (void)tiling;
+    return true;
 #else
     (void)tiling;
     return false;
@@ -1497,7 +1498,7 @@ __aicore__ inline void WaitGatewayWindow(GM_ADDR workspace, const CombineTiling&
     WaitCompletionFlags(workspace, CrossCompletionSlot(tiling, gateway, end, 0U), remote ? 2U : 1U, signal_ub);
 }
 // Upstream scheduling shares peer observations through SyncAll. The
-// unweighted EP8 pipeline instead makes each active consumer observe
+// EP8 pipeline instead makes each active consumer observe
 // every peer itself before reading that window.
 template <bool EnableTrace, bool EnableProfile>
 __aicore__ inline void WaitSourceChunk(GM_ADDR workspace, const CombineTiling& tiling, uint32_t chunk, uint32_t core_id,
@@ -2530,15 +2531,15 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
     if (tiling.with_weights && is_reduce_core && reduce_core_index == 0U) {
         PublishWeightDone(workspace, tiling, reduce_core_num);
     }
-    // With 64 AIVs, unweighted EP8 uses expert cores 32..63 and return
+    // With 64 AIVs, EP8 uses expert cores 32..63 and return
     // owners 0..10. Source consumers use 32..63 in the first two windows
     // and 11..63 only in the final window.
     if (core_id < local_sender_num) {
         // All gather submissions finish first to avoid blocking a later group's
         // inputs while waiting for this local return's reduce_done.
 #ifdef DEEPEP_COMBINE_EP8_MTE
-        // Weighted EP8 retains the upstream four MTE copy lanes per peer.
-        // Only unweighted EP8 sends through UDMA, with one QP0 owner per peer.
+        // Hidden returns use one QP0 owner per remote peer; self-copy retains
+        // four MTE lanes. Weight stores do not use or share these SQs.
         const auto return_owner = UseEp8ReturnPipeline(tiling) ? Ep8ReturnOwner(tiling.rank_id, core_id)
                                                                : Ep8Owner{core_id / 4U, core_id % 4U};
         const uint32_t peer_rank = return_owner.peer, mte_lane = return_owner.lane;
@@ -2831,7 +2832,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
                 }
             }
             // Drain this window before reusing its input/output banks.
-            // Unweighted EP8 consumers join only at the terminal barrier.
+            // EP8 consumers join only at the terminal barrier.
             for (uint32_t slot = 0; slot < kReduceOutputSlots; ++slot) {
                 if (source_output_store_pending[slot]) {
                     const auto output_event_id = slot == 0U ? EVENT_ID1 : EVENT_ID2;
@@ -2856,7 +2857,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
         trace_recorder.Mark(combine_profile::ChunkSlot, combine_profile::SourcePhaseReduceEnd);
         trace_recorder.Save(combine_profile::ChunkSlot, trace_recorder.ChunkRecordIndex(window_end, 2U));
     }
-    // Unweighted EP8 consumers observed all required peers and drained input
+    // EP8 consumers observed all required peers and drained input
     // and output banks. Join all launched cores once, after their windows end;
     // there is no per-window collective in the independent-consumer path.
     // Outgoing CQ and remaining incoming-completion drains below must finish

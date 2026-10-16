@@ -50,7 +50,7 @@ def decode_profile(
     version = records[0][1] if len(records[0]) > 1 else 0
     words_per_record = {3: 64, VERSION: WORDS}.get(version)
     cross = 16 if world > 8 else 0
-    compact = ep8_rank_mte and not weights and len(records[11]) == WORDS and records[11][6] == 3
+    compact = ep8_rank_mte and len(records[11]) == WORDS and records[11][6] == 3
     local = (11 if compact else 32) if ep8_rank_mte else min(world, 8)
     for core, words in enumerate(records):
         if len(words) != words_per_record or any(type(v) is not int or not 0 <= v < 2**63 for v in words):
