@@ -43,7 +43,7 @@ SDK 和 CANN 由部署环境提供，完整编译命令见 [构建说明](../doc
 
 ## EpGmmFused 依赖
 
-EpGmmFused 使用单独准备的固定版本 CatCCOS、其 CATLASS 子模块及 SHMEM 源码/SDK，不以 MegaMoE 的 CATLASS 路径替代。准备命令、源码路径和版本检查见 [EpGmmFused 构建说明](../experiments/ep_gmm_fused/README.md#构建)；overlay 来源和打包许可见 [NOTICE](../experiments/ep_gmm_fused/NOTICE.md)。
+EpGmmFused 使用单独准备的固定版本 CatCCOS、其 CATLASS 子模块及 SHMEM 源码/SDK，不以 MegaMoE 的 CATLASS 路径替代。准备命令、源码路径和版本检查见 [EpGmmFused 构建说明](../experiments/ep_gmm_fused/README.md#构建)；overlay 许可及打包规则见 [NOTICE](../experiments/ep_gmm_fused/NOTICE.md)。
 
 SDK 提供方声明源码版本，`scripts/record_shmem_sdk.py` 校验固定头文件并记录头文件与库的校验和；运行时核对实际加载的 SHMEM 库。头文件哈希相同不能单独证明二进制来源。依赖更新时同步更新 gitlink、锁文件和验证记录。
 
