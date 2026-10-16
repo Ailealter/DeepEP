@@ -612,6 +612,7 @@ __aicore__ inline void StoreFlag(__gm__ uint64_t* flag_address, LocalTensor<uint
     flag_ub.SetValue(0, flag_value);
     NativeStore(flag_address, flag_ub, 1U);
 }
+#ifndef DEEPEP_COMBINE_EP8
 __aicore__ inline void Prepare(GM_ADDR workspace, const CombineTiling& tiling)
 {
     const uint32_t core_id = GetBlockIdx();
@@ -654,6 +655,7 @@ __aicore__ inline void Prepare(GM_ADDR workspace, const CombineTiling& tiling)
     }
     aclshmemx_barrier_all_vec();
 }
+#endif
 __aicore__ inline void WaitGatherDone(GM_ADDR workspace, uint32_t rank_num, uint32_t local_rank_num,
                                       uint32_t global_chunk, uint32_t contributor_mask,
                                       LocalTensor<uint64_t> gather_flags_ub)
@@ -1062,7 +1064,7 @@ __aicore__ inline void ReduceGateway(GM_ADDR workspace, GM_ADDR input, GlobalTen
 }
 __aicore__ inline bool UseLocalMte(uint32_t rank_num)
 {
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     return true;
 #else
     return rank_num >= 64U;
@@ -1130,7 +1132,7 @@ __aicore__ inline void PublishLocalMteFlag(__gm__ uint64_t* flag, uint32_t peer,
 // Weight stores retain their independent local-done / rank-done completion chain.
 __aicore__ inline bool UseEp8ReturnPipeline(const CombineTiling& tiling)
 {
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     (void)tiling;
     return true;
 #else
@@ -1138,7 +1140,7 @@ __aicore__ inline bool UseEp8ReturnPipeline(const CombineTiling& tiling)
     return false;
 #endif
 }
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
 __aicore__ inline void ValidateEp8PeerQp(const CombineTiling& tiling, uint32_t peer)
 {
     auto* info = aclshmemi_udma_qp_info_fetch();
@@ -1154,7 +1156,7 @@ __aicore__ inline void ValidateEp8PeerQp(const CombineTiling& tiling, uint32_t p
     }
 }
 #endif
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
 // Two warps compact token heads in forward-list order. Each warp handles
 // 128 tasks (four per lane); prefixes preserve order across both warps and
 // iteration boundaries, including split token runs.
@@ -1291,7 +1293,7 @@ __aicore__ inline void SendPartial(GM_ADDR workspace, GM_ADDR input, GlobalTenso
         copy.Init();
     }
     bool prepared = false;
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     if (UseEp8ReturnPipeline(tiling) && !use_mte && partial_class == PartialClass::All &&
         tiling.chunk_token_num <= kReturnDescriptorRows) {
         rows = SendEp8ReturnRowsSimt(workspace, input, forward_list_gm, tiling, destination_rank, task_begin, task_end,
@@ -1308,9 +1310,9 @@ __aicore__ inline void SendPartial(GM_ADDR workspace, GM_ADDR input, GlobalTenso
             continue;
         }
         const int32_t token_id = forward_list_gm.GetValue((source_task_base + task_index) * 6U + 1U);
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
         if (token_id >= 0) {
-            aclshmemi_kernel_abort("EP8 MTE requires rank-return metadata\n");
+            aclshmemi_kernel_abort("EP8 return pipeline requires rank-return metadata\n");
         }
 #endif
         const uint32_t primary_row = forward_list_gm.GetValue((source_task_base + task_index) * 6U + 2U);
@@ -1509,7 +1511,7 @@ __aicore__ inline void WaitSourceChunk(GM_ADDR workspace, const CombineTiling& t
     const bool ep8_pipeline = UseEp8ReturnPipeline(tiling);
     const uint32_t observer_begin = ep8_pipeline ? 0U : core_id;
     const uint32_t observer_stride = ep8_pipeline ? 1U : GetBlockNum();
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     const uint32_t self_copy_core = tiling.rank_id * 4U;
 #else
     const uint32_t self_copy_core = tiling.rank_id % 8U;
@@ -1624,7 +1626,7 @@ __aicore__ inline bool IsCrossPhysicalCore(const CombineTiling& tiling, uint32_t
 // Gateway reducers follow the contiguous cross pool.
 __aicore__ inline uint32_t ReduceLogicalIndex(const CombineTiling& tiling, uint32_t core_id)
 {
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     return core_id - GetBlockNum() / 2U;
 #else
     const uint32_t cross_count = tiling.rank_num > 8U ? tiling.num_cross_put_cores : 0U;
@@ -2230,7 +2232,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
     const uint32_t group_num = tiling.rank_num / tiling.group_size;
     // Each cross owner has an exclusive QP pair across all remote peers.
     const uint32_t cross_sender_num = tiling.rank_num <= 8U ? 0U : tiling.num_cross_put_cores;
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     const uint32_t local_sender_num = UseEp8ReturnPipeline(tiling) ? 11U : 32U;
     const uint32_t reduce_core_begin = GetBlockNum() / 2U;
 #else
@@ -2239,7 +2241,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
     const uint32_t reduce_core_num = GetBlockNum() - reduce_core_begin;
     const bool is_cross_sender = IsCrossPhysicalCore(tiling, core_id);
     CrossQuietPlan quiet_plan;
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     const bool is_reduce_core = core_id >= reduce_core_begin && core_id < GetBlockNum();
 #else
     const bool is_reduce_core = core_id >= 8U && core_id < GetBlockNum() && !is_cross_sender;
@@ -2293,9 +2295,9 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
     forward_list_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(forward_list));
     forward_counts_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(forward_counts));
     backward_counts_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(backward_counts));
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     if (tiling.rank_num != 8U || (core_id < 8U && backward_counts_gm.GetValue(core_id) != 0)) {
-        aclshmemi_kernel_abort("EP8 MTE requires rank-return metadata without gather tasks\n");
+        aclshmemi_kernel_abort("EP8 return pipeline requires rank-return metadata without gather tasks\n");
     }
 #endif
     chunk_ranges_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunk_ranges));
@@ -2314,14 +2316,14 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
     }
     profile.Mark(diagnostics::WeightSendEnd);
     profile.Mark(diagnostics::ProducerBegin);
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     if (core_id < local_sender_num) {
         profile.Set(diagnostics::GatherEnd, profile.Get(diagnostics::ProducerBegin));
     }
 #endif
     const bool local_mte = UseLocalMte(tiling.rank_num);
     // Each local core owns one MESH peer's QP0 or MTE stream, including its final drain.
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
     if (false) {
 #else
     if (core_id < local_rank_num) {
@@ -2537,7 +2539,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
     if (core_id < local_sender_num) {
         // All gather submissions finish first to avoid blocking a later group's
         // inputs while waiting for this local return's reduce_done.
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
         // Hidden returns use one QP0 owner per remote peer; self-copy retains
         // four MTE lanes. Weight stores do not use or share these SQs.
         const auto return_owner = UseEp8ReturnPipeline(tiling) ? Ep8ReturnOwner(tiling.rank_id, core_id)
@@ -2576,7 +2578,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
                        reinterpret_cast<__gm__ int32_t*>(chunk_ranges) +
                            (uint64_t(peer_rank) * tiling.chunks_per_group + chunk_index) * 2U,
                        2U);
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
             const uint32_t chunk_begin = range_ub.GetValue(0), chunk_end = range_ub.GetValue(1);
             const uint64_t task_count = chunk_end - chunk_begin;
             const uint64_t task_base = uint64_t(peer_rank) * tiling.forward_row_capacity;
@@ -2602,7 +2604,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
             trace_recorder.Mark(combine_profile::PeerSlotBase, combine_profile::Begin);
             SendPartial(workspace, input, forward_list_gm, tiling, peer_rank, task_begin, task_end, copy_ub,
                         wqe_scratch_ub, trace_recorder, combine_profile::PeerSlotBase, ~0U,
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
                         PartialClass::All);
             // Every UDMA batch closes with SO + CQE. QP0 quiet completes the
             // payload before peer-ready; self-copy separately joins four MTE lanes.
@@ -2618,7 +2620,7 @@ __aicore__ inline void Combine(GM_ADDR workspace, GM_ADDR input, GM_ADDR forward
                         PartialClass::All);
 #endif
             trace_recorder.Mark(combine_profile::PeerSlotBase, combine_profile::End);
-#ifdef DEEPEP_COMBINE_EP8_MTE
+#ifdef DEEPEP_COMBINE_EP8
             if (chunk_index == SoWindowEnd(tiling, chunk_index)) {
                 // MTE copies or the single-owner UDMA QP must complete
                 // before publishing this window epoch.
@@ -2920,6 +2922,7 @@ __aicore__ inline void Combine(GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_A
 }  // namespace
 // Session-level entry/exit barriers are separate from the arithmetic kernel.
 // All 64 AIVs participate, including empty experts and zero-token workers.
+#ifndef DEEPEP_COMBINE_EP8
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_prepare_kernel(
     GM_ADDR workspace, ascend_deepep::PutCombineTiling tiling)
 {
@@ -2928,6 +2931,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_prep
     Prepare(workspace, tiling);
 #endif
 }
+#endif
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_kernel(
     GM_ADDR workspace, GM_ADDR input, GM_ADDR forward, GM_ADDR counts, GM_ADDR backward, GM_ADDR backward_counts,
     GM_ADDR mask, GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta,
@@ -2939,10 +2943,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_kern
                    weight_meta, tiling);
 #endif
 }
+#ifndef DEEPEP_COMBINE_EP8
 extern "C" ASCEND_DEEPEP_EXPORT void combine_prepare_kernel_do(void* stream, uint8_t* workspace, uint8_t* tiling)
 {
     combine_prepare_kernel<<<64, 0, stream>>>(workspace, *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling));
 }
+#endif
 extern "C" ASCEND_DEEPEP_EXPORT void combine_kernel_do(void* stream, uint8_t* workspace, uint8_t* input,
                                                        uint8_t* forward, uint8_t* counts, uint8_t* backward,
                                                        uint8_t* backward_counts, uint8_t* mask, uint8_t* ranges,

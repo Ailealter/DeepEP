@@ -49,17 +49,17 @@ def token_range(chunk, tokens, chunk_tokens=256):
     return begin, min(tokens, begin + chunk_tokens)
 
 
-def decode(records, *, rank, world, tokens, sample, chunk_tokens=256, ep8_rank_mte=False):
-    if ep8_rank_mte and world != 8:
-        raise ValueError("EP8 rank MTE diagnostics require EP8")
+def decode(records, *, rank, world, tokens, sample, chunk_tokens=256, ep8_rank_pipeline=False):
+    if ep8_rank_pipeline and world != 8:
+        raise ValueError("EP8 return pipeline diagnostics require EP8")
     expected = shape(world, tokens, chunk_tokens)
-    local = 32 if ep8_rank_mte else min(world, 8)
-    gateway_begin = 32 if ep8_rank_mte else 24 if world > 8 else 8
+    local = 32 if ep8_rank_pipeline else min(world, 8)
+    gateway_begin = 32 if ep8_rank_pipeline else 24 if world > 8 else 8
     groups = world // min(world, 64)
     chunks = expected[1] // (groups + 2)
     if len(records) != 64 or any(len(core) != expected[1] for core in records):
         raise ValueError("Invalid chunk tensor shape")
-    compact = ep8_rank_mte and any(
+    compact = ep8_rank_pipeline and any(
         len(row) == WORDS and row[3] == 4 and row[30] == EP8_SINGLE_QP_FLAG for row in records[0]
     )
     window_pool = {}
@@ -144,11 +144,11 @@ def decode(records, *, rank, world, tokens, sample, chunk_tokens=256, ep8_rank_m
                 ((core if core < rank else core + 1) if core < 7 else rank)
                 if compact
                 else core // 4
-                if ep8_rank_mte
+                if ep8_rank_pipeline
                 else rank // 8 * 8 + core
             )
-            if ep8_rank_mte and kind == 1:
-                raise ValueError("EP8 rank MTE has no gather tasks")
+            if ep8_rank_pipeline and kind == 1:
+                raise ValueError("EP8 return pipeline has no gather tasks")
             if kind in (1, 4) and (core >= local or v["Peer"] != peer):
                 raise ValueError("Invalid local peer/core")
             begin, end = token_range(chunk, tokens, chunk_tokens)
@@ -197,8 +197,9 @@ def perfetto_trace(trace, source_name):
     if (
         trace["schema_version"] not in (1, VERSION)
         or (trace["ticks_per_us"], trace["precision_checked"]) != (TICKS_PER_US, True)
-        or trace["kernel"] not in ("combine_profile_kernel", "combine_ep8_mte_profile_kernel")
-        or (trace["kernel"] == "combine_ep8_mte_profile_kernel" and trace["world_size"] != 8)
+        or trace["kernel"]
+        not in ("combine_profile_kernel", "combine_ep8_profile_kernel", "combine_ep8_mte_profile_kernel")
+        or (trace["kernel"] != "combine_profile_kernel" and trace["world_size"] != 8)
     ):
         raise ValueError("Unsupported or unvalidated chunk format")
     events, rank = trace["events"], trace["rank"]
