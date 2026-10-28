@@ -91,8 +91,8 @@ constexpr TilingProfile kM131072K3584N6144ExportTiling{
 constexpr TilingProfile kM131072K3584N3072ExportTiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 32, 32, 1, 16, 2048, 2, 16, 1, 8, 8};
 
-const TilingProfile& SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
-                                  bool outputAllToAllV)
+TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
+                           bool outputAllToAllV)
 {
     // Every rank participating in one collective launch must select the same
     // communication geometry. In an imbalanced route, received_rows is local
@@ -115,7 +115,13 @@ const TilingProfile& SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t w
     if (isEightRank256ExpertCase && m == 131072 && k == 2048 && n == 512) {
         return outputAllToAllV ? kM131072K2048N512ExportTiling : kM131072K2048N512NonExportTiling;
     }
-    return kDefaultTiling;
+    TilingProfile result = kDefaultTiling;
+    if (worldSize > 8) {
+        const uint32_t alignedK = static_cast<uint32_t>(TilingValidation::CeilDiv(k, 256) * 256);
+        result.stageRows = TilingValidation::DefaultStageRows(alignedK, worldSize, result.m0, result.stageRows,
+                                                              result.workspaceStages);
+    }
+    return result;
 }
 
 TilingProfile ResolveTiling(const TilingProfile& defaultTiling, at::IntArrayRef values, bool exportOutput)
@@ -176,7 +182,8 @@ void AttachUdma(const at::Tensor& deviceAnchor, int64_t rank, int64_t worldSize,
                 int64_t workspaceBytes)
 {
     CheckNpuTensor(deviceAnchor, "device_anchor", at::kByte);
-    TORCH_CHECK(worldSize > 0 && worldSize <= 8 && rank >= 0 && rank < worldSize, "invalid UDMA topology");
+    TORCH_CHECK(worldSize > 0 && worldSize <= TilingValidation::kMaxRanks && rank >= 0 && rank < worldSize,
+                "invalid UDMA topology");
     TORCH_CHECK(workspaceAddress > 0 && workspaceBytes > 0, "invalid public runtime workspace");
     const c10::OptionalDeviceGuard guard(deviceAnchor.device());
     UdmaRuntime::Instance().Attach(static_cast<int32_t>(rank), static_cast<int32_t>(worldSize),
@@ -275,6 +282,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
     runtime.EnsureInitialized();
     runtime.CheckDevice(x.device().index());
     const int64_t worldSize = runtime.WorldSize();
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks, "ep_size must be in [1, 128]");
     TORCH_CHECK(epSize == worldSize, "TP=1 is required: ep_size must equal UDMA world_size");
     TORCH_CHECK(expertNum > 0 && expertNum % epSize == 0, "expert_num must be positive and divisible by ep_size");
     const int64_t localExpertNum = expertNum / epSize;
@@ -307,6 +315,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
         ResolveTiling(SelectTiling(m, k, n, static_cast<uint32_t>(worldSize), static_cast<uint32_t>(expertNum),
                                    allToAllVOutputOptional.has_value()),
                       tilingValues, allToAllVOutputOptional.has_value());
+    TORCH_CHECK(tiling.stageRows > 0, "symmetric workspace cannot hold one M0 tile per EP rank");
     {
         const auto hardware = TilingHardware(x);
         const TilingValidation::AllToAllV requested{tiling.m0,
@@ -381,7 +390,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
     TORCH_CHECK(blockDim > 0, "failed to query Ascend AI-core count");
     const uint32_t exportCoreCount = tiling.exportCoreCount == 0 ? blockDim : tiling.exportCoreCount;
     TORCH_CHECK(exportCoreCount > 0 && exportCoreCount <= blockDim, "export_core_count must be in [1, AI-core count]");
-    TORCH_CHECK(tiling.selfCopyCores > 0 && static_cast<uint64_t>(worldSize) + tiling.selfCopyCores - 1 <= blockDim,
+    TORCH_CHECK(TilingValidation::ValidSelfCopyCores(static_cast<uint32_t>(worldSize), blockDim, tiling.selfCopyCores),
                 "self_copy_cores exceeds the available AIV worker pool");
     const uint64_t fftsAddress = runtime.FftsAddress();
     auto launchWithConfig = [&](auto configTag) {
@@ -498,7 +507,8 @@ at::Tensor AllToAllVGroupedMatMulUdmaMeta(const at::Tensor& x, const at::Tensor&
 {
     (void)ResolveTiling(kDefaultTiling, tiling, false);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
-    TORCH_CHECK(epSize > 0 && expertNum > 0 && expertNum % epSize == 0, "invalid expert topology");
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
+                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     return at::empty({receivedRows, weight.size(2)}, x.options());
 }
@@ -509,7 +519,8 @@ at::Tensor AllToAllVGroupedMatMulUdmaOutMeta(const at::Tensor& x, const at::Tens
 {
     (void)ResolveTiling(kDefaultTiling, tiling, false);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
-    TORCH_CHECK(epSize > 0 && expertNum > 0 && expertNum % epSize == 0, "invalid expert topology");
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
+                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(output.dim() == 2 && output.size(0) == receivedRows && output.size(1) == weight.size(2),
                 "invalid out shape");
@@ -522,6 +533,8 @@ std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaExportMeta(
     at::IntArrayRef tiling)
 {
     (void)ResolveTiling(kDefaultTiling, tiling, true);
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
+                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(
         allToAllVOutput.dim() == 2 && allToAllVOutput.size(0) == receivedRows && allToAllVOutput.size(1) == x.size(1),
@@ -536,7 +549,8 @@ std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaOutExportMeta(
 {
     (void)ResolveTiling(kDefaultTiling, tiling, true);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
-    TORCH_CHECK(epSize > 0 && expertNum > 0 && expertNum % epSize == 0, "invalid expert topology");
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
+                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(output.dim() == 2 && output.size(0) == receivedRows && output.size(1) == weight.size(2),
                 "invalid out shape");

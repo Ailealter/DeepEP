@@ -65,7 +65,7 @@ constexpr TilingProfile kEp4K3072N3584Tiling{
 constexpr TilingProfile kEp4K6144N3584Tiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 16, 16, 1, 16, 2048, 2, 8, 8};
 
-const TilingProfile& SelectTiling(uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum)
+TilingProfile SelectTiling(uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum)
 {
     // The local GMM input rows equal sum(global_tokens) and may differ across
     // ranks under imbalanced routing. UDMA peers must nevertheless use the same
@@ -87,7 +87,13 @@ const TilingProfile& SelectTiling(uint32_t k, uint32_t n, uint32_t worldSize, ui
     if (isEightRank256ExpertCase && k == 512 && n == 2048) {
         return kK512N2048Tiling;
     }
-    return kDefaultTiling;
+    TilingProfile result = kDefaultTiling;
+    if (worldSize > 8) {
+        // One M tile per peer decouples staging from AI-core count / EP.
+        // In particular EP64/128 need not divide coreCount * commInterval.
+        result.stageRows = result.m0;
+    }
+    return result;
 }
 
 TilingProfile ResolveTiling(const TilingProfile& defaultTiling, at::IntArrayRef values)
@@ -165,6 +171,7 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
     runtime.EnsureInitialized();
     runtime.CheckDevice(x.device().index());
     const int64_t worldSize = runtime.WorldSize();
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks, "ep_size must be in [1, 128]");
     TORCH_CHECK(epSize == worldSize, "TP=1 is required: ep_size must equal UDMA world_size");
     TORCH_CHECK(expertNum > 0 && expertNum % epSize == 0, "expert_num must be positive and divisible by ep_size");
     const int64_t localExpertNum = expertNum / epSize;
@@ -186,8 +193,6 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
 
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     TORCH_CHECK(blockDim > 0, "failed to query Ascend AI-core count");
-    TORCH_CHECK(static_cast<int64_t>(blockDim) >= worldSize,
-                "target-order UDMA staging requires at least one AI core per rank");
     const uint32_t m = static_cast<uint32_t>(inputRows64);
     const uint32_t k = static_cast<uint32_t>(k64);
     const uint32_t n = static_cast<uint32_t>(n64);

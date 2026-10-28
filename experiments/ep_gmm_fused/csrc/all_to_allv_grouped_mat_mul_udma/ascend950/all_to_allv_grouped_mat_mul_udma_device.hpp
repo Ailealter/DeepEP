@@ -77,7 +77,7 @@ struct AllToAllVGroupedMatMulUdmaConfig {
     using BlockExport =
         Catccos::Comm::Block::CommBlock<ExportDispatch, AType, AType, void, TileExportCopy, TileScheduler>;
 
-    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, 8, 64>;
+    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, TilingValidation::kMaxRanks, 64>;
     using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, MSplit>;
     using BlockScheduler = Catccos::Comm::Block::BlockCommSchedulerAllToAllVAllGather<MoeConstraints>;
     using ProblemShape = Catccos::DGemm::AllToAllVAllGatherProblemShape;

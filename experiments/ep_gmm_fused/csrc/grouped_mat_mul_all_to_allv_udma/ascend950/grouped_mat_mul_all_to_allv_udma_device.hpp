@@ -52,7 +52,7 @@ struct GroupedMatMulAllToAllVUdmaConfig {
     using BlockMmad = Catlass::Gemm::Block::BlockMmadTla<MmadDispatchPolicy, L1TileShape, L0TileShape, ElementA,
                                                          ElementB, ElementC, void, TileCopy>;
 
-    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, 8, 32>;
+    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, TilingValidation::kMaxRanks, 32>;
     static constexpr bool kIsDynamic = true;
     static constexpr uint32_t kUbStages = 2;
     static constexpr uint64_t kSymmetricDataBytes = 200UL * 1024 * 1024 * sizeof(uint16_t);

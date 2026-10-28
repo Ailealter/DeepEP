@@ -458,16 +458,20 @@ public:
 
             if constexpr (USE_UDMA_PEER_SERIAL_SCHEDULE) {
                 // A UDMA queue is owned by one AIV subcore for each destination PE.
+                // A core visits multiple peers when EP exceeds the core count.
                 // Sharing a PE and sync-id between many AIV cores can corrupt or
                 // drop requests. The regular variant keeps local MTE on subcore 0
                 // and remote UDMA puts on subcore 1; the export variant reserves
                 // subcore 0 for the preceding stage's export.
-                bool isPrimaryPeerCore = aicoreIdx < rankSize;
-                bool isExtraSelfCopyCore = aicoreIdx >= rankSize && aicoreIdx < rankSize + selfCopyCores - 1;
-                if (isPrimaryPeerCore || isExtraSelfCopyCore) {
-                    uint32_t dstRankIdx = isExtraSelfCopyCore ? rankIdx : aicoreIdx;
+                MoePeerSchedule peerSchedule{rankSize, rankIdx, coreCount, aicoreIdx, selfCopyCores};
+                bool isPrimaryPeerCore = peerSchedule.isPrimaryPeerCore;
+                bool isExtraSelfCopyCore = peerSchedule.isExtraSelfCopyCore;
+                uint32_t firstPeer = peerSchedule.firstPeer;
+                uint32_t peerStride = peerSchedule.peerStride;
+                for (uint32_t dstRankIdx = firstPeer;
+                     (isPrimaryPeerCore || isExtraSelfCopyCore) && dstRankIdx < rankSize; dstRankIdx += peerStride) {
                     bool isLocalCopy = dstRankIdx == rankIdx;
-                    uint32_t selfWorkerIdx = isExtraSelfCopyCore ? aicoreIdx - rankSize + 1 : 0;
+                    uint32_t selfWorkerIdx = peerSchedule.selfWorkerIdx;
                     bool ownsPeer;
                     if constexpr (EXPORT_ALLTOALLV) {
                         // Subcore 0 is dedicated to export. Subcore 1 owns both
@@ -552,6 +556,17 @@ public:
                                 }
                             }
                             completionPeerIdx = dstRankIdx;
+                        }
+                    }
+                    if constexpr (EXPORT_ALLTOALLV) {
+                        // A completion counter belongs to one peer. Drain and
+                        // signal before this worker proceeds to its next peer;
+                        // the final peer retains the existing loop-end drain.
+                        if (completedBlocks > 0 && dstRankIdx + peerStride < rankSize) {
+                            blockRemoteCopy.CompleteForSignal();
+                            aclshmemx_signal_op(syncCommFinish, completedBlocks, ACLSHMEM_SIGNAL_ADD,
+                                                completionPeerIdx);
+                            completedBlocks = 0;
                         }
                     }
                 }
@@ -666,6 +681,8 @@ private:
         }
 
         uint64_t sourceOffsets[BlockMmadScheduler::MoeConstraints::RANK_SIZE_LIMIT]{0};
+        bool useRouteMetadata =
+            params.problemShape.rankSize() <= MOE_ROUTE_MAX_RANKS && params.routeMetadata != nullptr;
         uint64_t outputOffset = 0;
         uint64_t windowStart = static_cast<uint64_t>(commIdx) * commShapeM;
         uint64_t windowEnd = windowStart + commShapeM;
@@ -675,7 +692,7 @@ private:
                 uint64_t sourceOffset = sourceOffsets[srcRankIdx];
                 uint64_t tokenCount = params.problemShape.globalTokensPerLocalExpert(srcRankIdx, localExpertIdx);
                 uint64_t segmentOutputOffset = outputOffset;
-                if (params.routeMetadata != nullptr) {
+                if (useRouteMetadata) {
                     uint32_t segmentIdx = localExpertIdx * params.problemShape.rankSize() + srcRankIdx;
                     sourceOffset = params.routeMetadata->segments[segmentIdx].sourceRowOffset;
                     tokenCount = params.routeMetadata->segments[segmentIdx].rows;
@@ -709,7 +726,7 @@ private:
                     auto layoutDst = layoutOutput.GetTileLayout(actualBlockShape);
                     blockExport(gmSrc, layoutSrc, gmDst, layoutDst, actualBlockShape);
                 }
-                if (params.routeMetadata == nullptr) {
+                if (!useRouteMetadata) {
                     sourceOffsets[srcRankIdx] += tokenCount;
                     outputOffset += tokenCount;
                 }
