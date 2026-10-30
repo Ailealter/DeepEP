@@ -74,6 +74,8 @@ public:
         LayoutC layoutC;
         LayoutTagComm layoutTagComm;
         GM_ADDR ptrSymmetric;
+        // Ordinary local GM, one private scheduling table per AIC.
+        GM_ADDR ptrSchedulerWorkspace{nullptr};
         GM_ADDR syncMmadFinish;
         GM_ADDR syncCommFinish;
         uint32_t selfCopyCores;
@@ -398,7 +400,11 @@ private:
             groupsPerCommInRank = Max<uint32_t>(1U, tilePerCommInRank / nLoops);
         }
         GemmCoord mmadBlockShape{L1_TILE_M, L1_TILE_N, L1_TILE_K};
-        BlockMmadScheduler scheduler{params.problemShape, groupsPerCommInRank, mmadBlockShape.GetCoordMN()};
+        const uint64_t schedulerOffset =
+            static_cast<uint64_t>(AscendC::GetBlockIdx()) * BlockMmadScheduler::WORKSPACE_BYTES;
+        GM_ADDR schedulerWorkspace = params.ptrSchedulerWorkspace + schedulerOffset;
+        BlockMmadScheduler scheduler{params.problemShape, groupsPerCommInRank, mmadBlockShape.GetCoordMN(),
+                                     schedulerWorkspace};
 
         uint32_t stageRows = groupsPerCommInRank * L1_TILE_M;
         auto layoutTagSymmetric =

@@ -7,6 +7,7 @@
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
@@ -122,7 +123,7 @@ TilingProfile ResolveTiling(const TilingProfile& defaultTiling, at::IntArrayRef 
     return result;
 }
 
-constexpr uint32_t kMaxLocalExperts = 32;
+constexpr uint32_t kMaxLocalExperts = 64;
 constexpr uint32_t kBf16UbAlignElements = 16;
 
 uint32_t TargetOrderLocalCopyColumns(uint32_t columns)
@@ -305,8 +306,19 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
         SelectedDeviceOp deviceOp;
         const Catlass::Status initializeStatus = deviceOp.Initialize(arguments);
         TORCH_CHECK(initializeStatus == Catlass::Status::kSuccess, "failed to initialize the CatCCOS device operator");
-        const typename SelectedDeviceOp::Params params = deviceOp.params();
+        using Scheduler = typename SelectedConfig::BlockMmadScheduler;
+        const int64_t schedulerBytes =
+            static_cast<int64_t>(static_cast<uint64_t>(blockDim) * Scheduler::WORKSPACE_BYTES);
+        const auto schedulerWorkspace = at::empty({schedulerBytes}, x.options().dtype(at::kByte));
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(schedulerWorkspace.data_ptr()) % 64 == 0,
+                    "scheduler workspace must be cache-line aligned");
+        c10_npu::NPUCachingAllocator::recordStream(schedulerWorkspace.storage().data_ptr(),
+                                                 c10_npu::getCurrentNPUStream());
+        typename SelectedDeviceOp::Params params = deviceOp.params();
+        params.ptrSchedulerWorkspace = reinterpret_cast<uint8_t*>(schedulerWorkspace.data_ptr());
         auto launch = [=]() -> int {
+            // Keep the allocation alive while RunOpApi queues the launch callback.
+            (void)schedulerWorkspace;
             LaunchGroupedMatMulAllToAllVUdma<SelectedKernel>(params, blockDim, stream, fftsAddress);
             return 0;
         };

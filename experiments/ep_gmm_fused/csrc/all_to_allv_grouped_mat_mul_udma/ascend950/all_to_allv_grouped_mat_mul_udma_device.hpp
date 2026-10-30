@@ -27,7 +27,7 @@
 #include "catccos/comm/tile/tile_remote_copy_udma_2d.hpp"
 #include "catccos/detail/remote_copy_type.hpp"
 #include "catccos/dgemm/alltoallv_allgather_problem_shape.hpp"
-#include "catccos/dgemm/block/block_scheduler_alltoallv_allgather.hpp"
+#include "catccos/dgemm/block/block_scheduler_alltoallv_allgather_gm.hpp"
 #include "catccos/dgemm/device/device_dgemm.hpp"
 #include "catccos/dgemm/kernel/ascend950_alltoallv_grouped_matmul.hpp"
 
@@ -78,7 +78,7 @@ struct AllToAllVGroupedMatMulUdmaConfig {
         Catccos::Comm::Block::CommBlock<ExportDispatch, AType, AType, void, TileExportCopy, TileScheduler>;
 
     using MoeConstraints = Catccos::DGemm::MoeConstraints<1, TilingValidation::kMaxRanks, 64>;
-    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, MSplit>;
+    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerAllToAllVAllGatherGm<MoeConstraints, MSplit>;
     using BlockScheduler = Catccos::Comm::Block::BlockCommSchedulerAllToAllVAllGather<MoeConstraints>;
     using ProblemShape = Catccos::DGemm::AllToAllVAllGatherProblemShape;
     using Kernel =

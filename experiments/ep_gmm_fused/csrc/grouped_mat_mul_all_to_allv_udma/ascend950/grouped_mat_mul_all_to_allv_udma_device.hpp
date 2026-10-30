@@ -27,7 +27,7 @@
 #include "catccos/comm/tile/tile_remote_copy_udma_2d.hpp"
 #include "catccos/detail/remote_copy_type.hpp"
 #include "catccos/dgemm/alltoallv_allgather_problem_shape.hpp"
-#include "catccos/dgemm/block/block_scheduler_gmm_alltoallv_target_order.hpp"
+#include "catccos/dgemm/block/block_scheduler_gmm_alltoallv_target_order_gm.hpp"
 #include "catccos/dgemm/device/device_dgemm.hpp"
 #include "catccos/dgemm/kernel/grouped_matmul_alltoallv_tla.hpp"
 
@@ -52,11 +52,11 @@ struct GroupedMatMulAllToAllVUdmaConfig {
     using BlockMmad = Catlass::Gemm::Block::BlockMmadTla<MmadDispatchPolicy, L1TileShape, L0TileShape, ElementA,
                                                          ElementB, ElementC, void, TileCopy>;
 
-    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, TilingValidation::kMaxRanks, 32>;
+    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, TilingValidation::kMaxRanks, 64>;
     static constexpr bool kIsDynamic = true;
     static constexpr uint32_t kUbStages = 2;
     static constexpr uint64_t kSymmetricDataBytes = 200UL * 1024 * 1024 * sizeof(uint16_t);
-    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints>;
+    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerGmmAllToAllVTargetOrderGm<MoeConstraints>;
     using BlockCommScheduler =
         Catccos::CommEpilogue::Block::BlockCommSchedulerGmmAllToAllVTargetOrder<MoeConstraints, kIsDynamic>;
     using CType = Catlass::Gemm::GemmType<ElementC, LayoutC>;
