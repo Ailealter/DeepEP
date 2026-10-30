@@ -34,7 +34,7 @@ inline at::Tensor GroupedMatMulAllToAllVUdmaMeta(const at::Tensor& x, const at::
     }
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
     TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
-                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
+                "invalid expert topology: ep_size must be in [1, 16] and divide expert_num");
     TORCH_CHECK(false,
                 "gmm_alltoallv has a route-dependent output shape; Meta/FakeTensor and torch.compile "
                 "require out= with shape [sum(local_tokens_per_expert), n]");
@@ -51,7 +51,7 @@ inline at::Tensor GroupedMatMulAllToAllVUdmaOutMeta(const at::Tensor& x, const a
     }
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
     TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
-                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
+                "invalid expert topology: ep_size must be in [1, 16] and divide expert_num");
     TORCH_CHECK(output.dim() == 2 && output.size(1) == weight.size(2), "invalid out shape");
     return output;
 }

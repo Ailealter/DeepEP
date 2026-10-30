@@ -118,10 +118,12 @@ def validate_tiling(
             _integer(name, value)
     if m is not None:
         _integer("m", m, 0 if operator == GROUPED_MATMUL else 1)
-    if world_size is not None and world_size > 128:
-        raise ValueError("world_size must not exceed 128")
+    if world_size is not None and world_size > 16:
+        raise ValueError("world_size must not exceed 16")
     if aic_cores is not None and world_size is not None:
-        if result["self_copy_cores"] > max(1, aic_cores - world_size + 1):
+        if aic_cores < world_size:
+            raise ValueError("at least one AI core per rank is required")
+        if world_size + result["self_copy_cores"] - 1 > aic_cores:
             raise ValueError("self_copy_cores exceeds the available AIV worker pool")
     ub_capacity = min(_integer("ub_bytes", ub_bytes), UB_BYTES)
     local_rows = result["local_copy_tile_rows"]

@@ -90,7 +90,7 @@ TilingProfile SelectTiling(uint32_t k, uint32_t n, uint32_t worldSize, uint32_t 
     TilingProfile result = kDefaultTiling;
     if (worldSize > 8) {
         // One M tile per peer decouples staging from AI-core count / EP.
-        // In particular EP64/128 need not divide coreCount * commInterval.
+        // EP16 staging need not divide coreCount * commInterval.
         result.stageRows = result.m0;
     }
     return result;
@@ -122,7 +122,7 @@ TilingProfile ResolveTiling(const TilingProfile& defaultTiling, at::IntArrayRef 
     return result;
 }
 
-constexpr uint32_t kMaxLocalExperts = 32;
+constexpr uint32_t kMaxLocalExperts = 64;
 constexpr uint32_t kBf16UbAlignElements = 16;
 
 uint32_t TargetOrderLocalCopyColumns(uint32_t columns)
@@ -171,7 +171,7 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
     runtime.EnsureInitialized();
     runtime.CheckDevice(x.device().index());
     const int64_t worldSize = runtime.WorldSize();
-    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks, "ep_size must be in [1, 128]");
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks, "ep_size must be in [1, 16]");
     TORCH_CHECK(epSize == worldSize, "TP=1 is required: ep_size must equal UDMA world_size");
     TORCH_CHECK(expertNum > 0 && expertNum % epSize == 0, "expert_num must be positive and divisible by ep_size");
     const int64_t localExpertNum = expertNum / epSize;
@@ -193,6 +193,8 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
 
     const uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     TORCH_CHECK(blockDim > 0, "failed to query Ascend AI-core count");
+    TORCH_CHECK(static_cast<int64_t>(blockDim) >= worldSize,
+                "target-order UDMA staging requires at least one AI core per rank");
     const uint32_t m = static_cast<uint32_t>(inputRows64);
     const uint32_t k = static_cast<uint32_t>(k64);
     const uint32_t n = static_cast<uint32_t>(n64);

@@ -458,20 +458,16 @@ public:
 
             if constexpr (USE_UDMA_PEER_SERIAL_SCHEDULE) {
                 // A UDMA queue is owned by one AIV subcore for each destination PE.
-                // A core visits multiple peers when EP exceeds the core count.
                 // Sharing a PE and sync-id between many AIV cores can corrupt or
                 // drop requests. The regular variant keeps local MTE on subcore 0
                 // and remote UDMA puts on subcore 1; the export variant reserves
                 // subcore 0 for the preceding stage's export.
-                MoePeerSchedule peerSchedule{rankSize, rankIdx, coreCount, aicoreIdx, selfCopyCores};
-                bool isPrimaryPeerCore = peerSchedule.isPrimaryPeerCore;
-                bool isExtraSelfCopyCore = peerSchedule.isExtraSelfCopyCore;
-                uint32_t firstPeer = peerSchedule.firstPeer;
-                uint32_t peerStride = peerSchedule.peerStride;
-                for (uint32_t dstRankIdx = firstPeer;
-                     (isPrimaryPeerCore || isExtraSelfCopyCore) && dstRankIdx < rankSize; dstRankIdx += peerStride) {
+                bool isPrimaryPeerCore = aicoreIdx < rankSize;
+                bool isExtraSelfCopyCore = aicoreIdx >= rankSize && aicoreIdx < rankSize + selfCopyCores - 1;
+                if (isPrimaryPeerCore || isExtraSelfCopyCore) {
+                    uint32_t dstRankIdx = isExtraSelfCopyCore ? rankIdx : aicoreIdx;
                     bool isLocalCopy = dstRankIdx == rankIdx;
-                    uint32_t selfWorkerIdx = peerSchedule.selfWorkerIdx;
+                    uint32_t selfWorkerIdx = isExtraSelfCopyCore ? aicoreIdx - rankSize + 1 : 0;
                     bool ownsPeer;
                     if constexpr (EXPORT_ALLTOALLV) {
                         // Subcore 0 is dedicated to export. Subcore 1 owns both
@@ -556,17 +552,6 @@ public:
                                 }
                             }
                             completionPeerIdx = dstRankIdx;
-                        }
-                    }
-                    if constexpr (EXPORT_ALLTOALLV) {
-                        // A completion counter belongs to one peer. Drain and
-                        // signal before this worker proceeds to its next peer;
-                        // the final peer retains the existing loop-end drain.
-                        if (completedBlocks > 0 && dstRankIdx + peerStride < rankSize) {
-                            blockRemoteCopy.CompleteForSignal();
-                            aclshmemx_signal_op(syncCommFinish, completedBlocks, ACLSHMEM_SIGNAL_ADD,
-                                                completionPeerIdx);
-                            completedBlocks = 0;
                         }
                     }
                 }

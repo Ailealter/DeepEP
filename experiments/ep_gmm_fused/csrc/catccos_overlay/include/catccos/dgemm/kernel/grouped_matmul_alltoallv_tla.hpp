@@ -472,10 +472,11 @@ private:
         uint32_t coreCount = AscendC::GetBlockNum();
         uint32_t availableSelfCores = coreCount >= rankSize ? coreCount - rankSize + 1 : 1;
         uint32_t selfCopyCores = params.selfCopyCores == 0 ? 1U : Min(params.selfCopyCores, availableSelfCores);
-        MoePeerSchedule peerSchedule{rankSize, rankIdx, coreCount, aicoreIdx, selfCopyCores};
-        bool isPrimaryPeerCore = peerSchedule.isPrimaryPeerCore;
-        bool isExtraSelfCopyCore = peerSchedule.isExtraSelfCopyCore;
-        uint32_t selfWorkerIdx = peerSchedule.selfWorkerIdx;
+        bool isPrimaryPeerCore = aicoreIdx < rankSize;
+        bool isExtraSelfCopyCore = aicoreIdx >= rankSize && aicoreIdx < rankSize + selfCopyCores - 1;
+        uint32_t srcRankIdx = isExtraSelfCopyCore ? rankIdx : aicoreIdx;
+        uint32_t selfWorkerIdx = isExtraSelfCopyCore ? aicoreIdx - rankSize + 1 : 0;
+        uint32_t srcEpIdx = srcRankIdx % params.problemShape.epSize();
 
         uint32_t groupsPerCommInRank = params.stageRows / L1_TILE_M;
         if (params.stageRows == 0) {
@@ -488,7 +489,7 @@ private:
         GemmCoord mmadBlockShape{L1_TILE_M, L1_TILE_N, L1_TILE_K};
         MatrixCoord commBlockShape = params.blockCommParams.BlockShape();
         MatrixCoord commCoreSplit = params.blockCommSchedulerParams.CoreSplit();
-        BlockCommScheduler scheduler{params.problemShape,         groupsPerCommInRank, 0,
+        BlockCommScheduler scheduler{params.problemShape,         groupsPerCommInRank, srcEpIdx,
                                      mmadBlockShape.GetCoordMN(), commBlockShape,      commCoreSplit};
         BlockComm blockRemoteCopy(resource, params.blockCommParams);
 
@@ -504,11 +505,15 @@ private:
         gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC*>(params.ptrC));
         auto const& layoutC = params.layoutTagComm;
 
-        // Synchronization must not depend on a rank id fitting in the physical
-        // core range. The root always operates on this rank's local signals.
-        bool isSyncCore = (subcoreIdx == 0) && (aicoreIdx == 0);
+        bool isSyncCore = (subcoreIdx == 0) && (srcRankIdx == rankIdx);
+        // Only the primary self core owns synchronization. Extra self-copy
+        // workers map to the same source rank but must not duplicate it.
+        isSyncCore = isSyncCore && isPrimaryPeerCore;
         bool isCommCore = (subcoreIdx == 0) && (isPrimaryPeerCore || isExtraSelfCopyCore);
         auto syncMmadFinish = reinterpret_cast<__gm__ int32_t*>(params.syncMmadFinish);
+        if (isCommCore) {
+            syncMmadFinish = static_cast<__gm__ int32_t*>(aclshmem_ptr(params.syncMmadFinish, srcRankIdx));
+        }
         auto syncCommFinish = reinterpret_cast<__gm__ int32_t*>(params.syncCommFinish);
 
         if (isSyncCore) {
@@ -521,6 +526,7 @@ private:
         uint32_t commLoops = scheduler.GetCommLoops();
         for (uint32_t commIdx = 0; commIdx < commLoops; ++commIdx) {
             uint32_t stageIdx = commIdx % WORKSPACE_STAGES;
+            scheduler.UpdateCommContext(commIdx);
             receiveAccum += scheduler.GetActualReceiveAccum(commIdx);
 
             Catlass::Arch::CrossCoreWaitFlag(flagAicFinishStore[stageIdx]);
@@ -529,18 +535,8 @@ private:
                 aclshmemx_signal_op(syncMmadFinish, commIdx + 1, ACLSHMEM_SIGNAL_SET, rankIdx);
             }
 
-            // Keep one UDMA queue owner per peer, but let a core visit several
-            // peers when EP exceeds the physical core count.
-            uint32_t firstPeer = peerSchedule.firstPeer;
-            uint32_t peerStride = peerSchedule.peerStride;
-            for (uint32_t srcRankIdx = firstPeer; isCommCore && srcRankIdx < rankSize; srcRankIdx += peerStride) {
-                scheduler.UpdateCommContext(commIdx, srcRankIdx % params.problemShape.epSize());
-                if (!scheduler.HasInput()) {
-                    continue;
-                }
-                auto remoteSyncMmadFinish =
-                    static_cast<__gm__ int32_t*>(aclshmem_ptr(params.syncMmadFinish, srcRankIdx));
-                aclshmem_signal_wait_until(remoteSyncMmadFinish, ACLSHMEM_CMP_EQ, commIdx + 1);
+            if (isCommCore && scheduler.HasInput()) {
+                aclshmem_signal_wait_until(syncMmadFinish, ACLSHMEM_CMP_EQ, commIdx + 1);
 
                 uint32_t actualRows = scheduler.GetActualRows();
                 uint32_t workerRowOffset = 0;

@@ -282,7 +282,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
     runtime.EnsureInitialized();
     runtime.CheckDevice(x.device().index());
     const int64_t worldSize = runtime.WorldSize();
-    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks, "ep_size must be in [1, 128]");
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks, "ep_size must be in [1, 16]");
     TORCH_CHECK(epSize == worldSize, "TP=1 is required: ep_size must equal UDMA world_size");
     TORCH_CHECK(expertNum > 0 && expertNum % epSize == 0, "expert_num must be positive and divisible by ep_size");
     const int64_t localExpertNum = expertNum / epSize;
@@ -508,7 +508,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaMeta(const at::Tensor& x, const at::Tensor&
     (void)ResolveTiling(kDefaultTiling, tiling, false);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
     TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
-                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
+                "invalid expert topology: ep_size must be in [1, 16] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     return at::empty({receivedRows, weight.size(2)}, x.options());
 }
@@ -520,7 +520,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaOutMeta(const at::Tensor& x, const at::Tens
     (void)ResolveTiling(kDefaultTiling, tiling, false);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
     TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
-                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
+                "invalid expert topology: ep_size must be in [1, 16] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(output.dim() == 2 && output.size(0) == receivedRows && output.size(1) == weight.size(2),
                 "invalid out shape");
@@ -534,7 +534,7 @@ std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaExportMeta(
 {
     (void)ResolveTiling(kDefaultTiling, tiling, true);
     TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
-                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
+                "invalid expert topology: ep_size must be in [1, 16] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(
         allToAllVOutput.dim() == 2 && allToAllVOutput.size(0) == receivedRows && allToAllVOutput.size(1) == x.size(1),
@@ -550,7 +550,7 @@ std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaOutExportMeta(
     (void)ResolveTiling(kDefaultTiling, tiling, true);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
     TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
-                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
+                "invalid expert topology: ep_size must be in [1, 16] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(output.dim() == 2 && output.size(0) == receivedRows && output.size(1) == weight.size(2),
                 "invalid out shape");

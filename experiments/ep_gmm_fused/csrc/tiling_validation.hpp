@@ -14,7 +14,7 @@
 // be checked on a CPU. No function here modifies the device synchronization.
 namespace deepep::ep_gmm_fused::TilingValidation {
 
-constexpr uint32_t kMaxRanks = 128;
+constexpr uint32_t kMaxRanks = 16;
 constexpr uint64_t kSymmetricDataBytes = 400ULL * 1024 * 1024;
 // CATLASS Ascend950 LocalTensorBuffer allocates ArchTag::UB_SIZE, not the
 // physical 256 KiB. Device configuration headers assert this budget matches.
@@ -52,10 +52,8 @@ inline uint32_t DefaultStageRows(uint32_t columns, uint32_t worldSize, uint32_t 
 
 inline bool ValidSelfCopyCores(uint32_t worldSize, uint32_t coreCount, uint32_t selfCopyCores)
 {
-    // When ranks outnumber workers, each worker owns several peers, including
-    // the local peer on rank % coreCount. Extra self-copy workers need spare cores.
-    return selfCopyCores > 0 && coreCount > 0 &&
-           selfCopyCores <= (coreCount > worldSize ? coreCount - worldSize + 1 : 1);
+    // Each peer needs a primary core; extra self-copy workers use spare cores.
+    return selfCopyCores > 0 && static_cast<uint64_t>(worldSize) + selfCopyCores - 1 <= coreCount;
 }
 
 inline uint32_t LocalCopyRowCapacity(uint32_t columns, uint64_t ubBytes)
@@ -146,8 +144,8 @@ inline const char* ParseGroupedMatMul(const int64_t* values, size_t count, Group
 
 inline const char* CheckHardware(uint32_t worldSize, uint32_t coreCount, uint64_t ubBytes)
 {
-    if (worldSize == 0 || worldSize > kMaxRanks || coreCount == 0) {
-        return "tiling requires world_size in [1, 128] and a positive AI-core count";
+    if (worldSize == 0 || worldSize > kMaxRanks || coreCount < worldSize) {
+        return "tiling requires world_size in [1, 16] and at least one AI core per rank";
     }
     if (ubBytes <= kWqeScratchBytes) {
         return "failed to query a usable device UB capacity";
