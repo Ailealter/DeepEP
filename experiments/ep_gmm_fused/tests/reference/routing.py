@@ -11,9 +11,12 @@ def assignments(case, source):
     s = case.scenario or {}
     q, e, p = s["top_k"], case.local_experts, case.ep_size
     total, tokens = e * p, case.m // q
-    if case.m % q or q > total:
-        raise ValueError("model M must be divisible by legal TopK")
+    groups, selected_groups = s.get("n_group", 1), s.get("topk_group", 1)
+    if not 0 <= source < p:
+        raise ValueError("source rank must be inside the EP group")
     if "receive_ratio" in s:
+        if case.route != "hot_rank":
+            raise ValueError("receive_ratio requires the hot_rank route")
         hot = round(s["receive_ratio"] * case.m / p)
         cumulative = np.arange(tokens + 1, dtype=np.int64) * hot // tokens
         hot_per_token = np.diff(cumulative)
@@ -23,14 +26,32 @@ def assignments(case, source):
         hot_ids = (cumulative[:-1, None] + slots + source) % e
         other_start = np.arange(tokens) * q - cumulative[:-1]
         other_ids = e + (other_start[:, None] + slots - hot_per_token[:, None] + source) % (total - e)
-        return np.where(slots < hot_per_token[:, None], hot_ids, other_ids)
+        output = np.where(slots < hot_per_token[:, None], hot_ids, other_ids)
+        if groups > 1 and selected_groups < groups:
+            group_ids = np.sort(output // (total // groups), axis=1)
+            if np.any(1 + np.count_nonzero(np.diff(group_ids, axis=1), axis=1) > selected_groups):
+                raise ValueError("hot_rank assignments exceed topk_group")
+        return output
     if case.route == "balanced":
-        return (np.arange(case.m).reshape(tokens, q) + source * e) % total
+        output = np.arange(case.m).reshape(tokens, q)
+        output += source * e
+        if groups > 1 and selected_groups < groups:
+            group_size = total // groups
+            start = output[:, :1] // group_size * group_size
+            # Fold only positions outside the selected contiguous group window.
+            # q <= window capacity keeps each token's experts distinct; already
+            # legal balanced assignments retain their original expert IDs.
+            output -= start
+            output %= selected_groups * group_size
+            output += start
+        output %= total
+        return output
+    if case.route != "random":
+        raise ValueError("TopK routing supports balanced, random, or hot_rank with receive_ratio")
     rng = np.random.default_rng(s.get("routing_seed", case.seed) + source * 101)
     output = np.empty((tokens, q), dtype=np.int64)
     for begin in range(0, tokens, 2048):
         size = min(2048, tokens - begin)
-        groups, selected_groups = s.get("n_group", 1), s.get("topk_group", 1)
         scores = rng.random((size, total))
         if groups > 1:
             chosen = np.argpartition(rng.random((size, groups)), selected_groups - 1, axis=1)[:, :selected_groups]

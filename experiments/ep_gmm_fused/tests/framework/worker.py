@@ -115,10 +115,11 @@ def prepare(case, rank, package, torch, device, *, cache_dir=None, output_pool=N
         else:
             second_w = store.w(rank, second=True)
             w2 = torch.from_numpy(second_w).to(device=device, dtype=torch.bfloat16)
+            second_common = dict(common, tiling=(case.scenario or {}).get("second_tiling", case.tiling))
 
             def call():
                 middle = package.alltoallv_gmm(x, w, local, glob, **common, received_rows=received)
-                return package.gmm_alltoallv(middle, w2, local, glob, **common)
+                return package.gmm_alltoallv(middle, w2, local, glob, **second_common)
 
     def refresh(updated):
         nonlocal store
@@ -311,7 +312,10 @@ def run(args):
                 and not scenario.get("contract") == "reject_zero_input"
             ):
                 # Reuse the same out buffers and route tables with changed input data.
-                changed = replace(case, seed=case.seed + 1000003)
+                changed_scenario = dict(case.scenario or {})
+                if "top_k" in changed_scenario:
+                    changed_scenario.setdefault("routing_seed", case.seed)
+                changed = replace(case, seed=case.seed + 1000003, scenario=changed_scenario or None)
                 call.refresh(changed)
                 if scenario.get("category") == "rank_stagger":
                     delayed = 0 if scenario["delay_pattern"] == "first" else 1

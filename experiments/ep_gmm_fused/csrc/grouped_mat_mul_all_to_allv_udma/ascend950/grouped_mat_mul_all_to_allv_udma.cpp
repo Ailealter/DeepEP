@@ -306,16 +306,19 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
         SelectedDeviceOp deviceOp;
         const Catlass::Status initializeStatus = deviceOp.Initialize(arguments);
         TORCH_CHECK(initializeStatus == Catlass::Status::kSuccess, "failed to initialize the CatCCOS device operator");
-        using Scheduler = typename SelectedConfig::BlockMmadScheduler;
-        const int64_t schedulerBytes =
-            static_cast<int64_t>(static_cast<uint64_t>(blockDim) * Scheduler::WORKSPACE_BYTES);
-        const auto schedulerWorkspace = at::empty({schedulerBytes}, x.options().dtype(at::kByte));
-        TORCH_CHECK(reinterpret_cast<uintptr_t>(schedulerWorkspace.data_ptr()) % 64 == 0,
-                    "scheduler workspace must be cache-line aligned");
-        c10_npu::NPUCachingAllocator::recordStream(schedulerWorkspace.storage().data_ptr(),
-                                                 c10_npu::getCurrentNPUStream());
         typename SelectedDeviceOp::Params params = deviceOp.params();
-        params.ptrSchedulerWorkspace = reinterpret_cast<uint8_t*>(schedulerWorkspace.data_ptr());
+        at::Tensor schedulerWorkspace;
+        if constexpr (SelectedConfig::kUseGmScheduler) {
+            using Scheduler = typename SelectedConfig::BlockMmadScheduler;
+            const int64_t schedulerBytes =
+                static_cast<int64_t>(static_cast<uint64_t>(blockDim) * Scheduler::WORKSPACE_BYTES);
+            schedulerWorkspace = at::empty({schedulerBytes}, x.options().dtype(at::kByte));
+            TORCH_CHECK(reinterpret_cast<uintptr_t>(schedulerWorkspace.data_ptr()) % 64 == 0,
+                        "scheduler workspace must be cache-line aligned");
+            c10_npu::NPUCachingAllocator::recordStream(schedulerWorkspace.storage().data_ptr(),
+                                                       c10_npu::getCurrentNPUStream());
+            params.ptrSchedulerWorkspace = reinterpret_cast<uint8_t*>(schedulerWorkspace.data_ptr());
+        }
         auto launch = [=]() -> int {
             // Keep the allocation alive while RunOpApi queues the launch callback.
             (void)schedulerWorkspace;
@@ -324,22 +327,32 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
         };
         at_npu::native::OpCommand::RunOpApi("GroupedMatMulAllToAllVUdma", launch);
     };
+    auto launchWithScheduler = [&](auto configTag) {
+        using GmConfig = typename decltype(configTag)::type;
+        // Preserve the complete pre-expansion path for its original EP/expert
+        // range. New small-EP configurations with more experts retain GM.
+        if (worldSize <= 8 && localExpertNum <= 32) {
+            launchWithConfig(TypeTag<typename GmConfig::template WithScheduler<false>>{});
+        } else {
+            launchWithConfig(configTag);
+        }
+    };
     if (tiling.kernelVariant == KernelVariant::kM0_256N0_256) {
         if (tiling.workspaceStages == 3) {
-            launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaM0_256N0_256WS3Config>{});
+            launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaM0_256N0_256WS3Config>{});
         } else {
-            launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaM0_256N0_256Config>{});
+            launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaM0_256N0_256Config>{});
         }
     } else if (tiling.kernelVariant == KernelVariant::kM0_256) {
         if (tiling.workspaceStages == 3) {
-            launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaM0_256WS3Config>{});
+            launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaM0_256WS3Config>{});
         } else {
-            launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaM0_256Config>{});
+            launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaM0_256Config>{});
         }
     } else if (tiling.workspaceStages == 3) {
-        launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaDefaultWS3Config>{});
+        launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaDefaultWS3Config>{});
     } else {
-        launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaDefaultConfig>{});
+        launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaDefaultConfig>{});
     }
     return output;
 }

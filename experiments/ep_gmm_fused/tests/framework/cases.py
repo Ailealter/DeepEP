@@ -9,11 +9,79 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import itertools
 import json
+import math
 from pathlib import Path
 import random
 
 ROUTES = ("balanced", "random", "hot_expert", "hot_rank", "local", "remote", "ring", "empty_experts")
 DATA = ("normal", "uniform", "zero", "small", "sparse", "cancellation", "outliers", "labels")
+
+
+def _positive_integer(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _validate_token_scenario(case):
+    scenario = case.scenario or {}
+    token_fields = (
+        "global_tokens",
+        "local_tokens",
+        "expanded_rows",
+        "global_expanded_rows",
+    )
+    if "top_k" not in scenario:
+        if any(name in scenario for name in (*token_fields, "n_group", "topk_group")):
+            raise ValueError("token counts and routing groups require scenario.top_k")
+        return
+    q = _positive_integer(scenario["top_k"], "top_k")
+    m = _positive_integer(case.m, "m")
+    experts = case.ep_size * case.local_experts
+    if q > experts or m % q:
+        raise ValueError("m must be divisible by top_k, and top_k must not exceed the global expert count")
+    groups = _positive_integer(scenario.get("n_group", 1), "n_group")
+    selected = _positive_integer(scenario.get("topk_group", 1), "topk_group")
+    if experts % groups or selected > groups:
+        raise ValueError("n_group must divide the global expert count and topk_group must not exceed n_group")
+    if q > experts // groups * selected:
+        raise ValueError("top_k exceeds the expert capacity of topk_group")
+    if "routing_seed" in scenario:
+        seed = scenario["routing_seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("routing_seed must be a nonnegative integer")
+    if "receive_ratio" in scenario:
+        ratio = scenario["receive_ratio"]
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio):
+            raise ValueError("receive_ratio must be finite")
+        if not 0 < ratio < case.ep_size:
+            raise ValueError("receive_ratio must be positive and smaller than ep_size")
+        tokens = m // q
+        hot_rows = round(ratio * m / case.ep_size)
+        if (
+            hot_rows + tokens - 1
+        ) // tokens > case.local_experts or q - hot_rows // tokens > experts - case.local_experts:
+            raise ValueError("receive_ratio cannot preserve distinct experts per token")
+    for name in token_fields:
+        if name in scenario:
+            _positive_integer(scenario[name], name)
+    local_tokens = scenario.get("local_tokens", m // q)
+    if m != local_tokens * q:
+        raise ValueError("m must equal local_tokens * top_k")
+    if scenario.get("global_tokens", local_tokens * case.ep_size) != local_tokens * case.ep_size:
+        raise ValueError("global_tokens must equal local_tokens * ep_size")
+    if scenario.get("expanded_rows", m) != m:
+        raise ValueError("expanded_rows must equal m")
+    if scenario.get("global_expanded_rows", m * case.ep_size) != m * case.ep_size:
+        raise ValueError("global_expanded_rows must equal m * ep_size")
+    if "global_experts" in scenario:
+        _positive_integer(scenario["global_experts"], "global_experts")
+        if scenario["global_experts"] != experts:
+            raise ValueError("global_experts must equal local_experts * ep_size")
+    if "token_unit" in scenario:
+        _positive_integer(scenario["token_unit"], "token_unit")
+    if "token_scope" in scenario and scenario["token_scope"] != "global_original":
+        raise ValueError("token_scope must be global_original")
 
 
 @dataclass(frozen=True)
@@ -41,11 +109,11 @@ class CaseSpec:
             raise ValueError("unknown expected error contract")
         if self.operator not in {"alltoallv_gmm", "gmm_alltoallv", "composition"}:
             raise ValueError("unknown operator")
-        if self.ep_size not in (1, 2, 4, 8) or self.local_experts < 1:
+        if self.ep_size not in (1, 2, 4, 8, 16) or self.local_experts < 1:
             raise ValueError("invalid EP size or local expert count")
         if min(self.m, self.k, self.n) < 1:
             raise ValueError("m/k/n must be positive; zero input is tested as an API rejection")
-        limit = 64 if self.operator == "alltoallv_gmm" else 32
+        limit = 64
         if self.local_experts > limit and self.expected_error != "experts":
             raise ValueError(f"operator supports at most {limit} local experts")
         if self.route not in ROUTES or self.x_data not in DATA or self.w_data not in DATA:
@@ -54,6 +122,9 @@ class CaseSpec:
             raise ValueError("route_device must be host/cpu/npu")
         if self.export and self.operator != "alltoallv_gmm":
             raise ValueError("export is only defined for alltoallv_gmm")
+        if self.scenario is not None and not isinstance(self.scenario, dict):
+            raise ValueError("scenario must be an object")
+        _validate_token_scenario(self)
 
     @property
     def case_id(self):
@@ -198,7 +269,7 @@ def generate(suite="smoke", seed=20260920, random_count=24):
             )
             for i in range(random_count)
         ]
-        for op, limit in (("alltoallv_gmm", 64), ("gmm_alltoallv", 32)):
+        for op, limit in (("alltoallv_gmm", 64), ("gmm_alltoallv", 64)):
             cases.append(replace(base, operator=op, local_experts=limit + 1, expected_error="experts"))
             cases += [
                 replace(base, operator=op, expected_error=error)
