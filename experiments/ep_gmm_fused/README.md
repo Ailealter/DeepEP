@@ -156,16 +156,12 @@ destroy_udma_group()
 
 ## 张量与路由约定
 
-- 当前分支支持 EP size 1–128；BF16 contiguous NPU 输入；每卡权重 `[local_experts, K, N]`。
+- EP size 1–8；BF16 contiguous NPU 输入；每卡权重 `[local_experts, K, N]`。
 - `local_counts` 长度 `expert_num`，按目标 EP rank、目标 local expert 排列。
 - `received_counts` 长度相同，按源 EP rank、当前 rank 的 local expert 排列。
 - 正向输入 `[M,K]` 按全局专家排列，每 rank 的 M 相同；结果按 local expert、源 rank 排列。
 - 逆向输入使用正向结果的排列，结果恢复源 rank 的全局专家顺序；本地输入/输出行数可不同。
-- 两方向最多 64 个本地专家；输入 M 必须大于 0。
-- EP≤8 的正向使用原 R8/E64 调度器；逆向在每卡专家数≤32时使用原 R8/E32 调度器。
-  这些路径保留扩 EP 前的通信调度与 tiling，不分配 GM 调度表。
-  EP>8，以及逆向 EP≤8、每卡专家数33–64，使用 R128/E64 GM 调度器。
-  两种路径分别编译；实际栈、精度和性能仍需在目标设备验证。
+- 正向最多 64 个本地专家，逆向最多 32 个；输入 M 必须大于 0。
 - 路由可传 host 整数列表、CPU int64、NPU int64。host 路径每次包含 H2D；性能用例默认 NPU。
 - 正向可 `received_rows=` 避免 count D2H，可 `output_all_to_allv=True` 返回 `(result, dispatched)`。
 - 两算子均支持 `out=`；正向导出还支持 `all_to_allv_out=`。异步结果需按 NPU stream 规则消费。

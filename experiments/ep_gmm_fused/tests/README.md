@@ -204,52 +204,6 @@ case ID 根据完整配置生成；默认 seed=20260920 时，原 6 个 EP8 回�
 
 ## 性能
 
-EP16 使用同一套参考计算、精度判据和 msprof 采集。`ep16-smoke/topk/scale/all`
-分别为30/450/672/1152例，参数、case ID、顺序与之前独立脚本一致；原 `smoke` 等集合不改名。
-仓内 Shell 的 `perf/plan-perf` 仅选择两个单算子，排除 composition 后分别为20/300/448/768例；
-`accuracy/plan` 保留完整集合。直接调用 Python 模块可使用 `--exclude-operator composition`。
-`perf` 对每个 case 先启动独立 `accuracy` 进程，完成两轮全 rank 全输出检查并正常退出，
-再启动原生 `bench` 的 msprof 进程。精度计算不会混入采集，失败时不启动该例性能采集。
-所有节点的 launcher 均正常退出后才接受结果；缺失或失败的用例不输出耗时和 MFU。
-
-```bash
-# 从已加载 CANN/Conda/依赖的环境运行；仓内入口生成32 KiB ACL配置并检查ELF。
-bash scripts/run_ep16_gmm.sh build
-# 默认先测两个原有EP8固定用例：逐例精度门控后采集msprof/MFU。
-bash scripts/run_ep16_gmm.sh perf
-# EP8同口径回归确认后，再显式测EP16 smoke。
-EPGMM_PERF_SUITES=smoke bash scripts/run_ep16_gmm.sh perf
-# EP16 两个单算子的完整性能集合（768例，不含composition）
-EPGMM_PERF_SUITES=all bash scripts/run_ep16_gmm.sh perf
-# 直接调用模块时，需自行沿用同样的ACL配置和环境。
-python -m experiments.ep_gmm_fused.tests.run perf --suite ep16-smoke \
-  --exclude-operator composition \
-  --warmup 10 --iterations 20 --batches 5 --peak-tflops 378
-```
-
-仓内 Shell 入口及栈检查器随 Git 更新；不读取旧 `EPGMM_TEST_SCRIPT` 或
-`EPGMM_STACK_INSPECTOR` 指向的外部文件。其他路径、套件、设备和采样配置仍可通过环境变量覆盖。
-代码更新后须重新编译安装 wheel，单独 `git pull` 不会替换已安装的原生内核。
-
-`performance.csv` 使用明确的 `kernel_us_per_call`、`kernel_p90_us`、`kernel_p99_us` 列，
-不沿用旧 Event 列名。MFU 计算为 `2×EP×M×K×N/(kernel_us×10^6×EP×peak_tflops)×100`，
-composition 分子再乘2。M已经包含TopK展开，不能再乘专家数或TopK。
-`--peak-tflops` 是单卡BF16稠密Cube理论峰值；省略时不填MFU。
-Shell 的 `EPGMM_PEAK_TFLOPS=378` 对应当前950PR 28 Cube配置，其他设备应修改。
-kernel时长仍包含融合内核中的通信、等待和调度，不等于纯GEMM时间；旧Event结果不能直接作性能基线。
-`accuracy`、`bench` 保留各自原义；仅单独运行 `bench` 时不会补做精度。
-
-默认 `ep8-baseline` 为 case `64d79f3ff1f3e5e6` 和 `84dbe9c348d7b2d6`，每卡M=131072、G=32，
-分别为2048→512和512→2048，使用 `EPGMM_EP8_DEVICES`（默认0–7）。要确认小EP未退化，
-应与扩EP前版本在同设备、同case、同采样口径下对比；单个MFU数字不能证明未退化。
-
-当前 tiling 工具提供 `_tiling.candidates_for_case()` 候选枚举和 `load_tiling_config()` 配置加载，
-没有自动上板搜索、择优和生成 `best_tilings.json` 的命令。EP16已有通用默认tiling，但尚无本批shape
-在950PR 28核上的实测择优记录。反向默认搜索空间固定 `stage_rows/workspace_stages/self_copy_cores`，
-EP16默认 `stage_rows=128`；若要评估通信轮数，需显式扩大该维度并以 `aic_cores=28` 验证资源。
-生成候选case manifest后，可通过 `perf --cases <manifest>` 逐候选精度门控和采集。
-先完成EP8回归，再用EP16默认配置建立基线，最后逐项搜索并保留相同口径的前后结果。
-
 ```bash
 python -m experiments.ep_gmm_fused.tests.run bench --suite smoke \
   --warmup 10 --iterations 50 --batches 20

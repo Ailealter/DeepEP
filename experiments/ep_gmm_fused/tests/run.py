@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by zhu-mingzhe71 2026
 
-"""python -m experiments.ep_gmm_fused.tests.run {accuracy,bench,perf,profile,report}."""
+"""python -m experiments.ep_gmm_fused.tests.run {accuracy,bench,profile,report}."""
 
 import argparse
 from dataclasses import asdict
@@ -13,11 +13,9 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-import time
 
 from .framework.cases import generate, load_cases, save_cases
 from .performance.metrics import summarize
-from .performance.reporting import accuracy_gate, case_display, read_reports, write_performance_csv
 
 
 def execute(command, log, timeout, env=None):
@@ -44,107 +42,34 @@ def execute(command, log, timeout, env=None):
         raise RuntimeError(f"worker exit status {status}; see {log}")
 
 
-def write_completion(directory, completion):
-    path = Path(directory) / f"launcher-node-{completion['node_rank']}.json"
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(completion, indent=2) + "\n")
-    temporary.replace(path)
-
-
-def wait_for_launchers(directory, nnodes, timeout):
-    deadline = time.monotonic() + timeout
-    while True:
-        launchers, errors = read_reports(directory, "launcher-node-*.json")
-        if errors or any(item.get("completed") is not True for item in launchers):
-            raise RuntimeError("a peer launcher failed; see launcher-node reports")
-        if len(launchers) == nnodes and {item.get("node_rank") for item in launchers} == set(range(nnodes)):
-            break
-        if time.monotonic() >= deadline:
-            raise TimeoutError("timed out waiting for peer launcher completion")
-        time.sleep(0.2)
-
-
-def execute_case(directory, command, *, mode, node_rank, world_size, timeout, env, accuracy_command=None, nnodes=1):
-    """Finish accuracy workers on every node before starting profiler process trees."""
-    directory = Path(directory)
-    completion = {"node_rank": node_rank, "completed": False, "phase": "accuracy" if mode == "perf" else mode}
-    try:
-        if mode == "perf":
-            accuracy_dir = directory / "accuracy"
-            accuracy_completion = {"node_rank": node_rank, "completed": False, "phase": "accuracy"}
-            try:
-                execute(accuracy_command, directory / f"accuracy-node-{node_rank}.log", timeout, env)
-                gate = accuracy_gate(accuracy_dir, world_size)
-                if not gate["passed"]:
-                    raise RuntimeError(f"accuracy gate incomplete or failed: {gate['errors']}")
-                accuracy_completion["completed"] = True
-                write_completion(accuracy_dir, accuracy_completion)
-                wait_for_launchers(accuracy_dir, nnodes, timeout)
-            except BaseException as error:
-                accuracy_dir.mkdir(exist_ok=True)
-                accuracy_completion.update(completed=False, error=str(error))
-                write_completion(accuracy_dir, accuracy_completion)
-                raise
-            completion["phase"] = "bench"
-        execute(command, directory / f"worker-node-{node_rank}.log", timeout, env)
-        completion["completed"] = True
-        write_completion(directory, completion)
-        wait_for_launchers(directory, nnodes, timeout)
-    except BaseException as error:
-        completion.update(completed=False, error=str(error))
-        raise
-    finally:
-        # A late peer must not turn a timed-out launcher into a successful case.
-        write_completion(directory, completion)
-
-
 def report_run(root, baseline=None):
     root = Path(root)
     plan = json.loads((root / "plan.json").read_text())
     results = []
     for selection in plan["selections"]:
         directory = root / selection["case_id"]
-        ranks, errors = read_reports(directory, "rank-*.json")
+        ranks = [json.loads(p.read_text()) for p in sorted(directory.glob("rank-*.json"))]
         expected = set(range(selection["world_size"]))
         seen = {r["global_rank"] for r in ranks}
-        passed = not errors and seen == expected and all(r.get("passed", False) for r in ranks)
+        passed = seen == expected and all(r.get("passed", False) for r in ranks)
         row = {
             "case_id": selection["case_id"],
             "passed": passed,
             "expected_ranks": sorted(expected),
             "observed_ranks": sorted(seen),
             "rank_reports": ranks,
-            "errors": errors,
             "category": selection.get("category", "legacy"),
             "status": "passed" if passed else ("not_run" if not ranks else "failed_or_incomplete"),
         }
-        if plan.get("require_launcher_completion"):
-            launchers, read_errors = read_reports(directory, "launcher-node-*.json")
-            row["errors"].extend(read_errors)
-            row["launchers"] = launchers
-            row["passed"] &= (
-                not read_errors
-                and len(launchers) == plan["arguments"]["nnodes"]
-                and {item.get("node_rank") for item in launchers} == set(range(plan["arguments"]["nnodes"]))
-                and all(item.get("completed") is True for item in launchers)
-            )
-        if plan["mode"] == "perf":
-            row["accuracy"] = accuracy_gate(directory / "accuracy", selection["world_size"])
-            row["passed"] &= row["accuracy"]["passed"]
         if plan["mode"] == "profile":
-            captures, read_errors = read_reports(directory, "capture-*.json")
-            row["errors"].extend(read_errors)
+            captures = [json.loads(p.read_text()) for p in directory.glob("capture-*.json")]
+            row["captures"] = captures
+            row["passed"] &= len(captures) == len(expected) and all(c.get("passed") for c in captures)
+        elif plan["mode"] == "bench":
+            captures = [json.loads(p.read_text()) for p in sorted(directory.glob("capture-*.json"))]
             row["captures"] = captures
             row["passed"] &= (
-                not read_errors and len(captures) == len(expected) and all(c.get("passed") for c in captures)
-            )
-        elif plan["mode"] in ("bench", "perf"):
-            captures, read_errors = read_reports(directory, "capture-*.json")
-            row["errors"].extend(read_errors)
-            row["captures"] = captures
-            row["passed"] &= (
-                not read_errors
-                and len(captures) == len(expected)
+                len(captures) == len(expected)
                 and {c.get("global_rank") for c in captures} == expected
                 and all(c.get("passed", False) for c in captures)
             )
@@ -155,8 +80,7 @@ def report_run(root, baseline=None):
                 row["msprof"] = summarize(
                     [c["samples_us"] for c in captures], sample_semantics="max_rank_" + metrics.pop()
                 )
-        observed = ranks or row.get("launchers") or row.get("accuracy", {}).get("rank_reports") or row["errors"]
-        row["status"] = "passed" if row["passed"] else ("failed_or_incomplete" if observed else "not_run")
+        row["status"] = "passed" if row["passed"] else ("not_run" if not ranks else "failed_or_incomplete")
         results.append(row)
     result = {
         "schema_version": 1,
@@ -190,11 +114,6 @@ def report_run(root, baseline=None):
                 raise ValueError("baseline msprof version differs")
             row["speedup_p50"] = base["msprof"]["p50_us"] / row["msprof"]["p50_us"]
         result["baseline"] = str(Path(baseline).resolve())
-    performance_rows = []
-    if plan["mode"] in ("bench", "perf"):
-        cases = {case.case_id: case for case in load_cases(root / "cases.json")}
-        performance_rows = write_performance_csv(root, results, cases, plan["arguments"].get("peak_tflops"))
-        result["performance"] = performance_rows
     (root / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     lines = [
         "# EP_GMM_FUSED validation",
@@ -202,17 +121,10 @@ def report_run(root, baseline=None):
         f"Mode: {plan['mode']}; passed: {result['passed']}",
         "",
     ]
-    if plan["mode"] in ("bench", "perf"):
-        lines += ["| Case | Status | msprof p50 kernel duration (us) | MFU (%) |", "|---|---|---|---|"]
-        lines += [
-            f"| {row['case_name']} | {row['status']} | {row.get('kernel_us_per_call', '')} | {row.get('mfu_percent', '')} |"
-            for row in performance_rows
-        ]
-        lines += [
-            "",
-            "Accuracy: " + ("two full checks required before each capture." if plan["mode"] == "perf" else "not run."),
-        ]
-        lines += ["Composition samples sum the two target kernel durations."]
+    if plan["mode"] == "bench":
+        lines += ["| Case | Execution passed | msprof p50 of max-rank kernel duration (us) |", "|---|---|---|"]
+        lines += [f"| {r['case_id']} | {r['passed']} | {r.get('msprof', {}).get('p50_us', '')} |" for r in results]
+        lines += ["", "Accuracy: not run. Composition samples sum the two target kernel durations."]
     else:
         lines += ["| Case | Result |", "|---|---|"]
         lines += [f"| {r['case_id']} | {r['passed']} |" for r in results]
@@ -222,29 +134,12 @@ def report_run(root, baseline=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("accuracy", "bench", "perf", "profile", "report"))
-    parser.add_argument(
-        "--suite",
-        choices=(
-            "smoke",
-            "model",
-            "generalization",
-            "all",
-            "nightly",
-            "ep16-smoke",
-            "ep16-topk",
-            "ep16-scale",
-            "ep16-all",
-        ),
-        default="smoke",
-    )
+    parser.add_argument("mode", choices=("accuracy", "bench", "profile", "report"))
+    parser.add_argument("--suite", choices=("smoke", "model", "generalization", "all", "nightly"), default="smoke")
     parser.add_argument("--cases", help="saved schema_version=1 case manifest (exact replay)")
     parser.add_argument("--case-id")
-    parser.add_argument("--ep-size", type=int, choices=(1, 2, 4, 8, 16))
+    parser.add_argument("--ep-size", type=int, choices=(1, 2, 4, 8))
     parser.add_argument("--operator", choices=("alltoallv_gmm", "gmm_alltoallv", "composition"))
-    parser.add_argument(
-        "--exclude-operator", action="append", default=[], choices=("alltoallv_gmm", "gmm_alltoallv", "composition")
-    )
     parser.add_argument("--category", action="append", help="include category; repeat to select several")
     parser.add_argument("--exclude-category", action="append", default=[])
     parser.add_argument("--model", help="model ID substring")
@@ -264,9 +159,6 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--batches", type=int, default=10)
-    parser.add_argument(
-        "--peak-tflops", type=float, help="per-device BF16 dense Cube theoretical peak, for MFU reporting"
-    )
     parser.add_argument("--metric", choices=("PipeTimeline", "InstrTimeline", "op_summary"), default="PipeTimeline")
     parser.add_argument("--pipes")
     parser.add_argument("--nproc-per-node", type=int)
@@ -275,7 +167,7 @@ def main(argv=None):
     parser.add_argument("--master-addr", default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29500)
     args = parser.parse_args(argv)
-    if args.mode in ("bench", "perf"):
+    if args.mode == "bench":
         if args.pipes:
             parser.error("bench uses msprof op_summary; pipe selection is only supported by profile")
         args.metric = "op_summary"
@@ -290,20 +182,11 @@ def main(argv=None):
         return 0 if report_run(args.output, args.baseline)["passed"] else 1
     if min(args.iterations, args.batches, args.nnodes, args.timeout) < 1 or args.warmup < 0:
         parser.error("iterations/batches/nnodes/timeout must be positive; warmup nonnegative")
-    if args.peak_tflops is not None and not (0 < args.peak_tflops < float("inf")):
-        parser.error("peak-tflops must be finite and positive")
     if args.nnodes > 1 and (not args.run_id or not args.nproc_per_node):
         parser.error("multi-node runs require a shared --run-id, shared output filesystem and --nproc-per-node")
     if not 0 <= args.node_rank < args.nnodes:
         parser.error("node-rank outside nnodes")
-    if args.cases:
-        cases = load_cases(args.cases)
-    elif args.suite.startswith("ep16-"):
-        from .framework.ep16_cases import generate_ep16_cases
-
-        cases = generate_ep16_cases(args.suite.removeprefix("ep16-"), args.seed)
-    else:
-        cases = generate(args.suite, args.seed)
+    cases = load_cases(args.cases) if args.cases else generate(args.suite, args.seed)
     from .framework.catalog import category, counts
 
     cases = [
@@ -312,7 +195,6 @@ def main(argv=None):
         if (args.case_id is None or c.case_id == args.case_id)
         and (args.ep_size is None or c.ep_size == args.ep_size)
         and (args.operator is None or c.operator == args.operator)
-        and c.operator not in args.exclude_operator
         and (not args.category or category(c) in args.category)
         and category(c) not in args.exclude_category
         and (not args.model or args.model in (c.scenario or {}).get("model", ""))
@@ -337,7 +219,7 @@ def main(argv=None):
     with (root / f"node-{args.node_rank}.claim").open("x") as claim:
         claim.write(str(os.getpid()))
     profiler_config = None
-    if args.mode in ("bench", "perf", "profile"):
+    if args.mode in ("bench", "profile"):
         from .profiling.timeline import discover
 
         profiler_config = root / f"profiler-node-{args.node_rank}.json"
@@ -351,7 +233,7 @@ def main(argv=None):
                 indent=2,
             )
         )
-    selections, commands, accuracy_commands = [], [], []
+    selections, commands = [], []
     for case in cases:
         nproc = args.nproc_per_node or (case.scenario or {}).get("required_world_size", case.ep_size)
         world = nproc * args.nnodes
@@ -381,7 +263,7 @@ def main(argv=None):
             "--output",
             str(directory),
             "--mode",
-            "capture" if args.mode == "profile" else "bench" if args.mode == "perf" else args.mode,
+            "capture" if args.mode == "profile" else args.mode,
             "--bootstrap",
             args.bootstrap,
             "--timeout",
@@ -396,23 +278,10 @@ def main(argv=None):
         command += ["--golden-backend", args.golden_backend, "--golden-block-rows", str(args.golden_block_rows)]
         if args.reference_cache:
             command += ["--reference-cache", str(Path(args.reference_cache).resolve())]
-        if args.mode == "perf":
-            accuracy_dir = directory / "accuracy"
-            accuracy_dir.mkdir(exist_ok=(args.nnodes > 1))
-            accuracy_command = command.copy()
-            accuracy_command[accuracy_command.index("--mode") + 1] = "accuracy"
-            accuracy_command[accuracy_command.index("--output") + 1] = str(accuracy_dir)
-            accuracy_commands.append(accuracy_command)
         if profiler_config:
             command += ["--profiler-config", str(profiler_config)]
         selections.append(
-            {
-                "case_id": case.case_id,
-                "world_size": world,
-                "category": category(case),
-                "scenario": case.scenario,
-                **case_display(case),
-            }
+            {"case_id": case.case_id, "world_size": world, "category": category(case), "scenario": case.scenario}
         )
         commands.append(command)
     plan = {
@@ -420,8 +289,6 @@ def main(argv=None):
         "mode": args.mode,
         "selections": selections,
         "commands": commands,
-        "accuracy_commands": accuracy_commands,
-        "require_launcher_completion": True,
         "category_counts": counts(cases),
         "arguments": vars(args),
     }
@@ -437,19 +304,10 @@ def main(argv=None):
         worker_env = dict(os.environ)
         for name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS", "BLIS_NUM_THREADS"):
             worker_env[name] = str(args.blas_threads)
-        for index, (selection, command) in enumerate(zip(selections, commands)):
-            directory = root / selection["case_id"]
-            print(f"Running {selection['case_name']}", flush=True)
-            execute_case(
-                directory,
-                command,
-                mode=args.mode,
-                node_rank=args.node_rank,
-                world_size=selection["world_size"],
-                timeout=args.timeout,
-                env=worker_env,
-                accuracy_command=accuracy_commands[index] if args.mode == "perf" else None,
-                nnodes=args.nnodes,
+        for selection, command in zip(selections, commands):
+            print(f"Running {selection['case_id']}", flush=True)
+            execute(
+                command, root / selection["case_id"] / f"worker-node-{args.node_rank}.log", args.timeout, worker_env
             )
     finally:
         if args.node_rank == 0:
