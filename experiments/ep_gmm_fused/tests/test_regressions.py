@@ -110,6 +110,47 @@ def test_inverse_fixed_profiles_and_legacy_overrides(tiling, world, experts, k, 
             assert (default["stage_rows"], default["workspace_stages"], default["self_copy_cores"]) == (0, 2, 1)
 
 
+def test_ep8_88_expert_forward_profile(tiling):
+    case = dict(
+        operator=tiling.ALL_TO_ALLV,
+        shape=dict(m=40960, k=4096, n=3072),
+        world_size=8,
+        expert_num=88,
+        output_all_to_allv=True,
+    )
+    expected = dict(zip(tiling.TILING_FIELDS[tiling.ALL_TO_ALLV], (256, 256, 256, 32, 1024, 3, 8, 1, 16, 4)))
+    assert tiling.default_tiling(case) == expected
+    assert (
+        tiling.validate_tiling(
+            tiling.ALL_TO_ALLV, expected, output_all_to_allv=True, m=40960, n=3072, k=4096,
+            world_size=8, aic_cores=32
+        )
+        == expected
+    )
+    for changes in (
+        dict(output_all_to_allv=False),
+        dict(expert_num=256),
+        dict(world_size=4),
+        dict(shape=dict(m=40961, k=4096, n=3072)),
+        dict(shape=dict(m=40960, k=4095, n=3072)),
+        dict(shape=dict(m=40960, k=4096, n=3071)),
+    ):
+        assert tiling.default_tiling(dict(case, **changes))["m0"] == 128
+
+
+def test_ep8_88_expert_inverse_profile(tiling):
+    expected = dict(zip(tiling.TILING_FIELDS[tiling.GROUPED_MATMUL], (256, 256, 256, 1, 1, 256, 3, 2)))
+    # Rank-local rows must not change the schedule under imbalanced routing.
+    for m in (1, 41368, 262144):
+        case = dict(operator=tiling.GROUPED_MATMUL, shape=dict(m=m, k=1536, n=4096), world_size=8, expert_num=88)
+        assert tiling.default_tiling(case) == expected
+    assert (
+        tiling.validate_tiling(tiling.GROUPED_MATMUL, expected, n=4096, world_size=8, aic_cores=32) == expected
+    )
+    for changes in (dict(expert_num=256), dict(world_size=4), dict(shape=dict(m=1, k=1537, n=4096))):
+        assert tiling.default_tiling(dict(case, **changes))["m0"] == 128
+
+
 @pytest.mark.parametrize("shape", [(128, 256, 256), (256, 128, 256), (256, 256, 256)])
 @pytest.mark.parametrize("stages", [2, 3])
 def test_inverse_physical_staging_bounds(tiling, shape, stages):

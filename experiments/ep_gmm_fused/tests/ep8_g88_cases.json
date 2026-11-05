@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "operator": "alltoallv_gmm",
+      "ep_size": 8,
+      "local_experts": 11,
+      "m": 40960,
+      "k": 4096,
+      "n": 3072,
+      "route": "balanced",
+      "export": true,
+      "preallocate": true
+    },
+    {
+      "operator": "gmm_alltoallv",
+      "ep_size": 8,
+      "local_experts": 11,
+      "m": 40960,
+      "k": 1536,
+      "n": 4096,
+      "route": "balanced",
+      "preallocate": true
+    }
+  ]
+}

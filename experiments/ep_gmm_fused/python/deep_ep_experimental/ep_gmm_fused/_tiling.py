@@ -208,6 +208,8 @@ def default_tiling(case):
     operator = case["operator"]
     m, n, k = (case["shape"][axis] for axis in ("m", "n", "k"))
     business = case["world_size"] == 8 and case["expert_num"] == 256
+    # EP8 with 88 global experts (11 per rank) export/inverse search winners.
+    eight_rank_88_expert = case["world_size"] == 8 and case["expert_num"] == 88
     export = case.get("output_all_to_allv", False)
     if operator == ALL_TO_ALLV:
         values = [128, 256, 256, 64, 1280, 2, 32, 1, 0, 1]
@@ -216,6 +218,8 @@ def default_tiling(case):
             values[4] = min(values[4], capacity) // values[0] * values[0]
             if values[4] == 0:
                 raise ValueError("symmetric workspace cannot hold one M0 tile per EP rank")
+        if eight_rank_88_expert and export and m == 40960 and k == 4096 and n == 3072:
+            values = [256, 256, 256, 32, 1024, 3, 8, 1, 16, 4]
         if business and m == 131072 and k == 2048:
             if n == 1024:
                 values = (
@@ -238,6 +242,8 @@ def default_tiling(case):
         values = [128, 256, 256, 10, 32, 0, 2, 1]
         if case["world_size"] > 8:
             values[5] = values[0]
+        if eight_rank_88_expert and k == 1536 and n == 4096:
+            values = [256, 256, 256, 1, 1, 256, 3, 2]
         if business and n == 2048:
             if k == 1024:
                 values = [128, 256, 256, 10, 4, 0, 2, 1]

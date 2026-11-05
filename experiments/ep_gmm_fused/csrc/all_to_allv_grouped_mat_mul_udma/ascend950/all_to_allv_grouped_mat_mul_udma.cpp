@@ -92,6 +92,11 @@ constexpr TilingProfile kM131072K3584N6144ExportTiling{
 constexpr TilingProfile kM131072K3584N3072ExportTiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 32, 32, 1, 16, 2048, 2, 16, 1, 8, 8};
 
+// EP8 / 88 global experts (11 local experts) export search winner
+// 495d3532045d8b11: M=40960, K=4096, N=3072.
+constexpr TilingProfile kEp8K4096N3072ExportTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 4, 16, 32, 1, 16, 1024, 3, 8, 1, 16, 4};
+
 TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
                            bool outputAllToAllV)
 {
@@ -115,6 +120,10 @@ TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSiz
     }
     if (isEightRank256ExpertCase && m == 131072 && k == 2048 && n == 512) {
         return outputAllToAllV ? kM131072K2048N512ExportTiling : kM131072K2048N512NonExportTiling;
+    }
+    const bool isEightRank88ExpertCase = worldSize == 8 && expertNum == 88;
+    if (isEightRank88ExpertCase && outputAllToAllV && m == 40960 && k == 4096 && n == 3072) {
+        return kEp8K4096N3072ExportTiling;
     }
     TilingProfile result = kDefaultTiling;
     if (worldSize > 8) {

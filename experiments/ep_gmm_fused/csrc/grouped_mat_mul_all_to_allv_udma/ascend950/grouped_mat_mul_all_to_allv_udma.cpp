@@ -66,6 +66,12 @@ constexpr TilingProfile kEp4K3072N3584Tiling{
 constexpr TilingProfile kEp4K6144N3584Tiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 16, 16, 1, 16, 2048, 2, 8, 8};
 
+// EP8 / 88 global experts (11 local experts) search winner 23b253bfc3f054e3:
+// K=1536, N=4096. comm_block_m and the worker split keep the pre-existing
+// default values; the search only adjusted the eight physical/legacy fields.
+constexpr TilingProfile kEp8K1536N4096Tiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 1, 2, 64, 1, 16, 256, 3, 1, 2};
+
 TilingProfile SelectTiling(uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum)
 {
     // The local GMM input rows equal sum(global_tokens) and may differ across
@@ -87,6 +93,10 @@ TilingProfile SelectTiling(uint32_t k, uint32_t n, uint32_t worldSize, uint32_t 
     }
     if (isEightRank256ExpertCase && k == 512 && n == 2048) {
         return kK512N2048Tiling;
+    }
+    const bool isEightRank88ExpertCase = worldSize == 8 && expertNum == 88;
+    if (isEightRank88ExpertCase && k == 1536 && n == 4096) {
+        return kEp8K1536N4096Tiling;
     }
     TilingProfile result = kDefaultTiling;
     if (worldSize > 8) {
