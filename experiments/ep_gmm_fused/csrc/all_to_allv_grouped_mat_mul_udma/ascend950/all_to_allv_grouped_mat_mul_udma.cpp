@@ -97,6 +97,11 @@ constexpr TilingProfile kM131072K3584N3072ExportTiling{
 constexpr TilingProfile kEp8K4096N3072ExportTiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 4, 16, 32, 1, 16, 1024, 3, 8, 1, 16, 4};
 
+// EP8 / 88 global experts export search winner 680bfbb229fb71e8: M=40960,
+// K=4096, N=1536. export_core_count 0 keeps every AI core in the export pool.
+constexpr TilingProfile kEp8K4096N1536ExportTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 4, 16, 128, 1, 16, 1024, 2, 8, 1, 0, 8};
+
 TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
                            bool outputAllToAllV)
 {
@@ -124,6 +129,9 @@ TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSiz
     const bool isEightRank88ExpertCase = worldSize == 8 && expertNum == 88;
     if (isEightRank88ExpertCase && outputAllToAllV && m == 40960 && k == 4096 && n == 3072) {
         return kEp8K4096N3072ExportTiling;
+    }
+    if (isEightRank88ExpertCase && outputAllToAllV && m == 40960 && k == 4096 && n == 1536) {
+        return kEp8K4096N1536ExportTiling;
     }
     TilingProfile result = kDefaultTiling;
     if (worldSize > 8) {

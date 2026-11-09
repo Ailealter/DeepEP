@@ -220,6 +220,8 @@ def default_tiling(case):
                 raise ValueError("symmetric workspace cannot hold one M0 tile per EP rank")
         if eight_rank_88_expert and export and m == 40960 and k == 4096 and n == 3072:
             values = [256, 256, 256, 32, 1024, 3, 8, 1, 16, 4]
+        if eight_rank_88_expert and export and m == 40960 and k == 4096 and n == 1536:
+            values = [256, 256, 256, 128, 1024, 2, 8, 1, 0, 8]
         if business and m == 131072 and k == 2048:
             if n == 1024:
                 values = (
@@ -244,6 +246,8 @@ def default_tiling(case):
             values[5] = values[0]
         if eight_rank_88_expert and k == 1536 and n == 4096:
             values = [256, 256, 256, 1, 1, 256, 3, 2]
+        if eight_rank_88_expert and k == 3072 and n == 4096:
+            values = [256, 256, 256, 1, 8, 256, 2, 4]
         if business and n == 2048:
             if k == 1024:
                 values = [128, 256, 256, 10, 4, 0, 2, 1]

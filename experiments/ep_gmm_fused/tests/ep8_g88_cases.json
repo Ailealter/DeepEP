@@ -21,6 +21,27 @@
       "n": 4096,
       "route": "balanced",
       "preallocate": true
+    },
+    {
+      "operator": "alltoallv_gmm",
+      "ep_size": 8,
+      "local_experts": 11,
+      "m": 40960,
+      "k": 4096,
+      "n": 1536,
+      "route": "balanced",
+      "export": true,
+      "preallocate": true
+    },
+    {
+      "operator": "gmm_alltoallv",
+      "ep_size": 8,
+      "local_experts": 11,
+      "m": 40960,
+      "k": 3072,
+      "n": 4096,
+      "route": "balanced",
+      "preallocate": true
     }
   ]
 }

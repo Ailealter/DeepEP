@@ -151,6 +151,47 @@ def test_ep8_88_expert_inverse_profile(tiling):
         assert tiling.default_tiling(dict(case, **changes))["m0"] == 128
 
 
+def test_ep8_88_expert_forward_n1536_profile(tiling):
+    case = dict(
+        operator=tiling.ALL_TO_ALLV,
+        shape=dict(m=40960, k=4096, n=1536),
+        world_size=8,
+        expert_num=88,
+        output_all_to_allv=True,
+    )
+    expected = dict(zip(tiling.TILING_FIELDS[tiling.ALL_TO_ALLV], (256, 256, 256, 128, 1024, 2, 8, 1, 0, 8)))
+    assert tiling.default_tiling(case) == expected
+    assert (
+        tiling.validate_tiling(
+            tiling.ALL_TO_ALLV, expected, output_all_to_allv=True, m=40960, n=1536, k=4096,
+            world_size=8, aic_cores=32
+        )
+        == expected
+    )
+    for changes in (
+        dict(output_all_to_allv=False),
+        dict(expert_num=256),
+        dict(world_size=4),
+        dict(shape=dict(m=40961, k=4096, n=1536)),
+        dict(shape=dict(m=40960, k=4095, n=1536)),
+        dict(shape=dict(m=40960, k=4096, n=1537)),
+    ):
+        assert tiling.default_tiling(dict(case, **changes))["m0"] == 128
+
+
+def test_ep8_88_expert_inverse_k3072_profile(tiling):
+    expected = dict(zip(tiling.TILING_FIELDS[tiling.GROUPED_MATMUL], (256, 256, 256, 1, 8, 256, 2, 4)))
+    # Rank-local rows must not change the schedule under imbalanced routing.
+    for m in (1, 41312, 262144):
+        case = dict(operator=tiling.GROUPED_MATMUL, shape=dict(m=m, k=3072, n=4096), world_size=8, expert_num=88)
+        assert tiling.default_tiling(case) == expected
+    assert (
+        tiling.validate_tiling(tiling.GROUPED_MATMUL, expected, n=4096, world_size=8, aic_cores=32) == expected
+    )
+    for changes in (dict(expert_num=256), dict(world_size=4), dict(shape=dict(m=1, k=3073, n=4096))):
+        assert tiling.default_tiling(dict(case, **changes))["m0"] == 128
+
+
 @pytest.mark.parametrize("shape", [(128, 256, 256), (256, 128, 256), (256, 256, 256)])
 @pytest.mark.parametrize("stages", [2, 3])
 def test_inverse_physical_staging_bounds(tiling, shape, stages):
